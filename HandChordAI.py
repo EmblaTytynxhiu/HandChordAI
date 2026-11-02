@@ -1,18 +1,42 @@
-import cv2
-import numpy as np
-import mediapipe as mp
+"""
+AI Virtual Guitar
+A two-hand gesture-controlled virtual guitar.
+
+Requirements:
+    python -m pip install mediapipe opencv-python numpy
+
+Run:
+    python HandChordAI.py
+
+Controls:
+    Q      Quit
+    D      Toggle tracking diagnostics
+    R      Reset gesture recognition and stop audio
+    SPACE  Replay the currently selected chord
+
+The screen-left hand selects the chord root.
+The screen-right hand selects the chord quality.
+Audio sustains while the chord gesture is held.
+"""
+
+from __future__ import annotations
+
 import math
 import time
-import wave
 import urllib.request
+import wave
 import winsound
 
+from collections import Counter, deque
 from pathlib import Path
-from collections import deque, Counter
+
+import cv2
+import mediapipe as mp
+import numpy as np
 
 
 # ============================================================
-# 1. PROJECT CONFIGURATION
+# 1. CONFIGURATION
 # ============================================================
 
 PROJECT_NAME = "AI VIRTUAL GUITAR"
@@ -21,12 +45,14 @@ CAMERA_INDEX = 0
 CAMERA_WIDTH = 960
 CAMERA_HEIGHT = 720
 
-# Fixed display dimensions: approximately 16:9
 DISPLAY_WIDTH = 1280
-DISPLAY_HEIGHT = 760
+CAMERA_VIEW_HEIGHT = 560
+DASHBOARD_HEIGHT = 340
+
+DISPLAY_HEIGHT = CAMERA_VIEW_HEIGHT + DASHBOARD_HEIGHT
 
 SAMPLE_RATE = 44100
-CHORD_DURATION = 1.4
+LOOP_DURATION = 2.0
 
 MAX_HANDS = 2
 
@@ -40,52 +66,52 @@ BENT_THRESHOLD = 0.46
 HISTORY_SIZE = 9
 REQUIRED_VOTES = 6
 
-CHORD_COOLDOWN = 0.65
+RELEASE_GRACE_SECONDS = 0.45
 
 BASE_DIR = Path(__file__).resolve().parent
 
 SOUND_DIR = BASE_DIR / "sounds"
-SOUND_DIR.mkdir(exist_ok=True)
-
 MODEL_PATH = BASE_DIR / "hand_landmarker.task"
 
+SOUND_DIR.mkdir(exist_ok=True)
+
 MODEL_URL = (
-    "https://storage.googleapis.com/"
-    "mediapipe-models/hand_landmarker/"
-    "hand_landmarker/float16/1/"
+    "https://storage.googleapis.com/mediapipe-models/"
+    "hand_landmarker/hand_landmarker/float16/1/"
     "hand_landmarker.task"
 )
 
 WINDOW_NAME = "AI Virtual Guitar - Studio"
 
 
+# OpenCV uses BGR instead of RGB.
+
+COLORS = {
+    "background": (17, 22, 32),
+    "panel": (20, 26, 38),
+    "card": (32, 41, 56),
+    "active": (37, 83, 62),
+
+    "text": (245, 247, 252),
+    "muted": (160, 175, 195),
+
+    "mint": (105, 230, 185),
+    "blue": (235, 155, 85),
+    "gold": (65, 195, 255),
+
+    "success": (90, 220, 135),
+    "warning": (75, 180, 255),
+
+    "border": (63, 76, 96),
+}
+
+
 # ============================================================
-# 2. INTERFACE COLORS - BGR FORMAT
+# 2. GESTURE MAPPING
 # ============================================================
 
-BG_MAIN = (17, 22, 32)
-BG_PANEL = (20, 26, 38)
-BG_CARD = (32, 41, 56)
-BG_CARD_ACTIVE = (37, 83, 62)
-
-TEXT_MAIN = (245, 247, 252)
-TEXT_MUTED = (160, 175, 195)
-
-ACCENT_MINT = (105, 230, 185)
-ACCENT_BLUE = (235, 155, 85)
-ACCENT_GOLD = (65, 195, 255)
-
-SUCCESS = (90, 220, 135)
-WARNING = (75, 180, 255)
-
-BORDER = (65, 77, 96)
-
-
-# ============================================================
-# 3. TWO-HAND GESTURE CONTROLS
-# ============================================================
-
-# SCREEN-LEFT HAND:
+# The left hand selects the root note.
+#
 # 0 fingers = E
 # 1 finger  = C
 # 2 fingers = G
@@ -97,11 +123,12 @@ ROOT_GESTURES = {
     1: "C",
     2: "G",
     3: "D",
-    4: "A"
+    4: "A",
 }
 
 
-# SCREEN-RIGHT HAND:
+# The right hand selects the chord type.
+#
 # 1 finger = Major
 # 2 fingers = Minor
 # 3 fingers = Dominant 7th
@@ -109,142 +136,176 @@ ROOT_GESTURES = {
 QUALITY_GESTURES = {
     1: "MAJOR",
     2: "MINOR",
-    3: "7TH"
+    3: "7TH",
 }
 
 
 # ============================================================
-# 4. CHORD LIBRARY
+# 3. CHORD DEFINITIONS
 # ============================================================
 
 CHORDS = {
+
+    # ---------------- C CHORDS ----------------
 
     ("C", "MAJOR"): {
         "name": "C MAJOR",
         "notes": "C - E - G",
         "frequencies": [261.63, 329.63, 392.00],
-        "fret": "x32010"
+        "fret": "x32010",
     },
 
     ("C", "MINOR"): {
         "name": "C MINOR",
         "notes": "C - Eb - G",
         "frequencies": [261.63, 311.13, 392.00],
-        "fret": "x35543"
+        "fret": "x35543",
     },
 
     ("C", "7TH"): {
         "name": "C7",
         "notes": "C - E - G - Bb",
         "frequencies": [261.63, 329.63, 392.00, 466.16],
-        "fret": "x32310"
+        "fret": "x32310",
     },
+
+
+    # ---------------- G CHORDS ----------------
 
     ("G", "MAJOR"): {
         "name": "G MAJOR",
         "notes": "G - B - D",
         "frequencies": [196.00, 246.94, 293.66],
-        "fret": "320003"
+        "fret": "320003",
     },
 
     ("G", "MINOR"): {
         "name": "G MINOR",
         "notes": "G - Bb - D",
         "frequencies": [196.00, 233.08, 293.66],
-        "fret": "355333"
+        "fret": "355333",
     },
 
     ("G", "7TH"): {
         "name": "G7",
         "notes": "G - B - D - F",
         "frequencies": [196.00, 246.94, 293.66, 349.23],
-        "fret": "320001"
+        "fret": "320001",
     },
+
+
+    # ---------------- D CHORDS ----------------
 
     ("D", "MAJOR"): {
         "name": "D MAJOR",
         "notes": "D - F# - A",
         "frequencies": [293.66, 369.99, 440.00],
-        "fret": "xx0232"
+        "fret": "xx0232",
     },
 
     ("D", "MINOR"): {
         "name": "D MINOR",
         "notes": "D - F - A",
         "frequencies": [293.66, 349.23, 440.00],
-        "fret": "xx0231"
+        "fret": "xx0231",
     },
 
     ("D", "7TH"): {
         "name": "D7",
         "notes": "D - F# - A - C",
         "frequencies": [293.66, 369.99, 440.00, 523.25],
-        "fret": "xx0212"
+        "fret": "xx0212",
     },
+
+
+    # ---------------- A CHORDS ----------------
 
     ("A", "MAJOR"): {
         "name": "A MAJOR",
         "notes": "A - C# - E",
         "frequencies": [220.00, 277.18, 329.63],
-        "fret": "x02220"
+        "fret": "x02220",
     },
 
     ("A", "MINOR"): {
         "name": "A MINOR",
         "notes": "A - C - E",
         "frequencies": [220.00, 261.63, 329.63],
-        "fret": "x02210"
+        "fret": "x02210",
     },
 
     ("A", "7TH"): {
         "name": "A7",
         "notes": "A - C# - E - G",
         "frequencies": [220.00, 277.18, 329.63, 392.00],
-        "fret": "x02020"
+        "fret": "x02020",
     },
+
+
+    # ---------------- E CHORDS ----------------
 
     ("E", "MAJOR"): {
         "name": "E MAJOR",
         "notes": "E - G# - B",
         "frequencies": [164.81, 207.65, 246.94],
-        "fret": "022100"
+        "fret": "022100",
     },
 
     ("E", "MINOR"): {
         "name": "E MINOR",
         "notes": "E - G - B",
         "frequencies": [164.81, 196.00, 246.94],
-        "fret": "022000"
+        "fret": "022000",
     },
 
     ("E", "7TH"): {
         "name": "E7",
         "notes": "E - G# - B - D",
         "frequencies": [164.81, 207.65, 246.94, 293.66],
-        "fret": "020100"
-    }
+        "fret": "020100",
+    },
 }
 
 
 # ============================================================
-# 5. HAND LANDMARK DEFINITIONS
+# 4. HAND LANDMARK CONNECTIONS
 # ============================================================
+
+# MediaPipe detects 21 landmarks on each hand.
+# These connections draw the hand skeleton.
 
 HAND_CONNECTIONS = [
 
-    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
 
-    (0, 5), (5, 6), (6, 7), (7, 8),
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
 
-    (5, 9), (9, 10), (10, 11), (11, 12),
+    (5, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
 
-    (9, 13), (13, 14), (14, 15), (15, 16),
+    (9, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
 
-    (13, 17), (17, 18), (18, 19), (19, 20),
+    (13, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
 
-    (0, 17)
+    (0, 17),
 ]
 
+
+# Four fingers used for chord recognition.
 
 FINGER_LANDMARKS = {
 
@@ -254,85 +315,75 @@ FINGER_LANDMARKS = {
 
     "RING": (13, 14, 15, 16),
 
-    "PINKY": (17, 18, 19, 20)
-
+    "PINKY": (17, 18, 19, 20),
 }
 
 
 # ============================================================
-# 6. DOWNLOAD HAND MODEL
+# 5. MEDIAPIPE MODEL
 # ============================================================
 
 def download_hand_model():
+    """
+    Download the MediaPipe hand-tracking model
+    if it is not already present.
+    """
+
+    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 100000:
+        return
 
     if MODEL_PATH.exists():
-
-        if MODEL_PATH.stat().st_size > 100000:
-
-            return
-
         MODEL_PATH.unlink()
 
-    print("Downloading hand detection model...")
+    temporary_path = MODEL_PATH.with_suffix(".task.part")
 
-    temporary_file = Path(
-        str(MODEL_PATH) + ".part"
+    request = urllib.request.Request(
+        MODEL_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0"
+        },
     )
 
     try:
 
-        request = urllib.request.Request(
-            MODEL_URL,
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            }
-        )
+        print("Downloading hand-tracking model...")
 
         with urllib.request.urlopen(
             request,
             timeout=90
         ) as response:
 
-            with open(
-                temporary_file,
-                "wb"
-            ) as output:
+            with temporary_path.open("wb") as model_file:
 
                 while True:
 
-                    data = response.read(1024 * 1024)
+                    chunk = response.read(1024 * 1024)
 
-                    if not data:
-
+                    if not chunk:
                         break
 
-                    output.write(data)
+                    model_file.write(chunk)
 
-        if temporary_file.stat().st_size < 100000:
+        if temporary_path.stat().st_size <= 100000:
+            raise RuntimeError(
+                "The downloaded model file is incomplete."
+            )
 
-            raise RuntimeError("Incomplete model file.")
+        temporary_path.replace(MODEL_PATH)
 
-        temporary_file.replace(MODEL_PATH)
+        print("Hand model downloaded successfully.")
 
-        print("Hand model downloaded.")
+    except Exception:
 
-    except Exception as error:
+        temporary_path.unlink(missing_ok=True)
 
-        if temporary_file.exists():
+        raise
 
-            temporary_file.unlink()
-
-        raise RuntimeError(
-            "Could not download the hand model. "
-            "Check your internet connection."
-        ) from error
-
-
-# ============================================================
-# 7. INITIALIZE MEDIAPIPE
-# ============================================================
 
 def create_hand_detector():
+    """
+    Configure and initialize MediaPipe Hand Landmarker.
+    """
 
     download_hand_model()
 
@@ -350,25 +401,24 @@ def create_hand_detector():
 
         min_hand_presence_confidence=PRESENCE_CONFIDENCE,
 
-        min_tracking_confidence=TRACKING_CONFIDENCE
-
+        min_tracking_confidence=TRACKING_CONFIDENCE,
     )
 
-    detector = (
-        mp.tasks.vision.HandLandmarker
-        .create_from_options(options)
+    return mp.tasks.vision.HandLandmarker.create_from_options(
+        options
     )
-
-    print("Two-hand tracking initialized.")
-
-    return detector
 
 
 # ============================================================
-# 8. FINGER RECOGNITION
+# 6. HAND GEOMETRY AND FINGER RECOGNITION
 # ============================================================
 
 def calculate_angle(point_a, point_b, point_c):
+    """
+    Calculate the angle between three points.
+
+    The middle point is the vertex of the angle.
+    """
 
     vector_a = point_a - point_b
 
@@ -378,7 +428,7 @@ def calculate_angle(point_a, point_b, point_c):
 
     length_c = np.linalg.norm(vector_c)
 
-    if length_a < 0.000001 or length_c < 0.000001:
+    if length_a < 1e-6 or length_c < 1e-6:
 
         return 0.0
 
@@ -399,24 +449,33 @@ def calculate_angle(point_a, point_b, point_c):
 
 
 def recognize_fingers(world_landmarks, previous_states):
+    """
+    Estimate which fingers are extended.
+
+    Uses joint angles, finger distances and
+    extension ratios.
+
+    Returns:
+        number of extended fingers
+        individual finger states
+        diagnostic measurements
+    """
 
     points = np.array(
 
         [
-            [landmark.x, landmark.y, landmark.z]
-
-            for landmark in world_landmarks
+            [point.x, point.y, point.z]
+            for point in world_landmarks
         ],
 
-        dtype=np.float64
-
+        dtype=np.float64,
     )
 
     states = {}
 
     diagnostics = {}
 
-    for finger_name, indices in FINGER_LANDMARKS.items():
+    for name, indices in FINGER_LANDMARKS.items():
 
         mcp_index, pip_index, dip_index, tip_index = indices
 
@@ -427,6 +486,9 @@ def recognize_fingers(world_landmarks, previous_states):
         dip = points[dip_index]
 
         tip = points[tip_index]
+
+
+        # Calculate joint angles.
 
         pip_angle = calculate_angle(
             mcp,
@@ -440,6 +502,10 @@ def recognize_fingers(world_landmarks, previous_states):
             tip
         )
 
+
+        # Calculate the distance between fingertips
+        # and the base of each finger.
+
         tip_distance = np.linalg.norm(
             tip - mcp
         )
@@ -448,10 +514,12 @@ def recognize_fingers(world_landmarks, previous_states):
             pip - mcp
         )
 
-        ratio = tip_distance / max(
-            pip_distance,
-            0.000001
+        extension_ratio = (
+            tip_distance / max(pip_distance, 1e-6)
         )
+
+
+        # Convert measurements into normalized scores.
 
         angle_score = np.clip(
             (pip_angle - 115) / 65,
@@ -466,10 +534,13 @@ def recognize_fingers(world_landmarks, previous_states):
         )
 
         ratio_score = np.clip(
-            (ratio - 0.90) / 0.65,
+            (extension_ratio - 0.90) / 0.65,
             0,
             1
         )
+
+
+        # Combine the measurements.
 
         score = (
             0.40 * angle_score
@@ -477,114 +548,158 @@ def recognize_fingers(world_landmarks, previous_states):
             + 0.35 * ratio_score
         )
 
-        was_extended = previous_states.get(
-            finger_name,
-            False
-        )
 
-        threshold = (
-            BENT_THRESHOLD
-            if was_extended
-            else EXTENSION_THRESHOLD
-        )
+        # Apply hysteresis to reduce flickering.
+
+        if previous_states.get(name, False):
+
+            threshold = BENT_THRESHOLD
+
+        else:
+
+            threshold = EXTENSION_THRESHOLD
+
 
         is_extended = (
             score >= threshold
             and pip_angle >= 135
         )
 
-        states[finger_name] = bool(is_extended)
+        states[name] = bool(is_extended)
 
-        diagnostics[finger_name] = {
+        diagnostics[name] = {
+
             "pip": pip_angle,
+
             "dip": dip_angle,
-            "ratio": ratio,
+
+            "ratio": extension_ratio,
+
             "score": score,
-            "extended": is_extended
+
+            "extended": bool(is_extended),
         }
 
-    finger_count = sum(
-        states.values()
-    )
 
-    return finger_count, states, diagnostics
+    extended_count = sum(states.values())
+
+    return extended_count, states, diagnostics
 
 
 # ============================================================
-# 9. DRAW HAND SKELETON
+# 7. DRAW HAND SKELETON
 # ============================================================
 
-def draw_hand(frame, image_landmarks, states, role):
+def draw_hand(frame, landmarks, states, role):
+    """
+    Draw hand landmarks and connections
+    on the webcam frame.
+    """
 
     height, width = frame.shape[:2]
 
-    points = []
+    points = [
 
-    for landmark in image_landmarks:
+        (
+            int(point.x * width),
+            int(point.y * height)
+        )
 
-        x = int(landmark.x * width)
+        for point in landmarks
+    ]
 
-        y = int(landmark.y * height)
-
-        points.append((x, y))
 
     if role == "ROOT":
 
-        line_color = ACCENT_MINT
-
-        label = "ROOT HAND"
+        line_color = COLORS["mint"]
 
     else:
 
-        line_color = ACCENT_BLUE
+        line_color = COLORS["blue"]
 
-        label = "CHORD TYPE"
 
-    for start_index, end_index in HAND_CONNECTIONS:
+    # Draw connections between landmarks.
+
+    for start, end in HAND_CONNECTIONS:
 
         cv2.line(
+
             frame,
-            points[start_index],
-            points[end_index],
+
+            points[start],
+
+            points[end],
+
             line_color,
+
             2,
-            cv2.LINE_AA
+
+            cv2.LINE_AA,
         )
+
+
+    # Draw all landmarks.
 
     for point in points:
 
         cv2.circle(
+
             frame,
+
             point,
+
             3,
-            (255, 255, 255),
+
+            (250, 250, 250),
+
             -1,
-            cv2.LINE_AA
+
+            cv2.LINE_AA,
         )
 
+
+    # Highlight fingertips.
+
     fingertips = {
+
         "INDEX": 8,
+
         "MIDDLE": 12,
+
         "RING": 16,
-        "PINKY": 20
+
+        "PINKY": 20,
     }
+
 
     for name, index in fingertips.items():
 
-        color = (
-            SUCCESS
-            if states[name]
-            else (90, 105, 125)
-        )
+        if states[name]:
+
+            color = COLORS["success"]
+
+        else:
+
+            color = (90, 105, 125)
+
 
         cv2.circle(
+
             frame,
+
             points[index],
+
             8,
+
             color,
+
             2,
-            cv2.LINE_AA
+
+            cv2.LINE_AA,
         )
+
+
+    # Add hand role label.
 
     wrist_x, wrist_y = points[0]
 
@@ -595,81 +710,188 @@ def draw_hand(frame, image_landmarks, states, role):
 
     label_y = max(
         20,
-        min(wrist_y + 29, height - 10)
+        min(wrist_y + 28, height - 10)
+    )
+
+    label = (
+        "ROOT HAND"
+        if role == "ROOT"
+        else "CHORD TYPE"
     )
 
     cv2.putText(
+
         frame,
+
         label,
+
         (label_x, label_y),
+
         cv2.FONT_HERSHEY_SIMPLEX,
+
         0.42,
+
         line_color,
+
         1,
-        cv2.LINE_AA
+
+        cv2.LINE_AA,
     )
 
 
 # ============================================================
-# 10. AUDIO GENERATION
+# 8. DETECT AND ORDER HANDS
+# ============================================================
+
+def detect_hands(detector, frame, timestamp):
+    """
+    Detect hands using MediaPipe.
+
+    Hands are sorted according to their horizontal
+    screen position.
+
+    The leftmost hand becomes the root selector.
+    The rightmost hand becomes the chord selector.
+    """
+
+    rgb_frame = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2RGB
+    )
+
+    rgb_frame = np.ascontiguousarray(
+        rgb_frame
+    )
+
+    mp_image = mp.Image(
+
+        image_format=mp.ImageFormat.SRGB,
+
+        data=rgb_frame,
+    )
+
+    result = detector.detect_for_video(
+        mp_image,
+        timestamp
+    )
+
+    hands = []
+
+    for index, image_landmarks in enumerate(
+        result.hand_landmarks or []
+    ):
+
+        if index >= len(
+            result.hand_world_landmarks or []
+        ):
+
+            continue
+
+
+        world_landmarks = (
+            result.hand_world_landmarks[index]
+        )
+
+        center_x = float(
+
+            np.mean(
+
+                [
+                    point.x
+                    for point in image_landmarks
+                ]
+            )
+        )
+
+
+        hands.append(
+
+            (
+                center_x,
+                image_landmarks,
+                world_landmarks
+            )
+        )
+
+
+    hands.sort(
+        key=lambda item: item[0]
+    )
+
+    return hands
+
+
+# ============================================================
+# 9. AUDIO GENERATION
 # ============================================================
 
 def generate_chord(frequencies, filename):
+    """
+    Generate a WAV file containing a chord.
 
-    total_samples = int(
-        SAMPLE_RATE * CHORD_DURATION
+    Several harmonics are combined to create
+    a richer synthesized guitar-like tone.
+
+    The generated file is designed to loop.
+    """
+
+    sample_count = int(
+        SAMPLE_RATE * LOOP_DURATION
     )
 
-    mixed_audio = np.zeros(
-        total_samples,
+    sample_indices = np.arange(
+        sample_count,
         dtype=np.float64
     )
 
-    strum_delay = 0.035
+    mixed_audio = np.zeros(
+        sample_count,
+        dtype=np.float64
+    )
 
-    for note_index, frequency in enumerate(frequencies):
 
-        start = int(
-            note_index * strum_delay * SAMPLE_RATE
+    for frequency in frequencies:
+
+        # Use an integer number of cycles
+        # to help the audio loop smoothly.
+
+        cycles = round(
+            frequency * LOOP_DURATION
         )
 
-        remaining = total_samples - start
-
-        t = np.arange(
-            remaining,
-            dtype=np.float64
-        ) / SAMPLE_RATE
-
-        fundamental = np.sin(
-            2 * np.pi * frequency * t
+        loop_frequency = (
+            cycles / LOOP_DURATION
         )
 
-        harmonic_2 = 0.30 * np.sin(
-            2 * np.pi * frequency * 2 * t
+        phase = (
+
+            2
+            * np.pi
+            * loop_frequency
+            * sample_indices
+            / SAMPLE_RATE
         )
 
-        harmonic_3 = 0.12 * np.sin(
-            2 * np.pi * frequency * 3 * t
-        )
 
-        harmonic_4 = 0.05 * np.sin(
-            2 * np.pi * frequency * 4 * t
-        )
-
-        attack = 1 - np.exp(-65 * t)
-
-        decay = np.exp(-2.5 * t)
-
-        envelope = attack * decay
+        # Fundamental frequency and harmonics.
 
         note = (
-            fundamental
-            + harmonic_2
-            + harmonic_3
-            + harmonic_4
-        ) * envelope
 
-        mixed_audio[start:] += note * 0.25
+            np.sin(phase)
+
+            + 0.30 * np.sin(2 * phase)
+
+            + 0.12 * np.sin(3 * phase)
+
+            + 0.05 * np.sin(4 * phase)
+        )
+
+        mixed_audio += (
+            note / len(frequencies)
+        )
+
+
+    # Normalize volume.
 
     peak = np.max(
         np.abs(mixed_audio)
@@ -677,54 +899,57 @@ def generate_chord(frequencies, filename):
 
     if peak > 0:
 
-        mixed_audio /= peak
+        mixed_audio = (
+            mixed_audio / peak * 0.78
+        )
 
-        mixed_audio *= 0.85
 
-    fade_length = int(
-        SAMPLE_RATE * 0.08
-    )
-
-    mixed_audio[-fade_length:] *= np.linspace(
-        1.0,
-        0.0,
-        fade_length
-    )
+    # Convert floating-point samples
+    # into 16-bit PCM audio.
 
     pcm = (
         mixed_audio * 32767
     ).astype("<i2")
 
+
     with wave.open(
         str(filename),
         "wb"
-    ) as audio:
+    ) as audio_file:
 
-        audio.setnchannels(1)
+        audio_file.setnchannels(1)
 
-        audio.setsampwidth(2)
+        audio_file.setsampwidth(2)
 
-        audio.setframerate(SAMPLE_RATE)
+        audio_file.setframerate(
+            SAMPLE_RATE
+        )
 
-        audio.writeframes(
+        audio_file.writeframes(
             pcm.tobytes()
         )
 
 
 # ============================================================
-# 11. CREATE AND PLAY CHORDS
+# 10. GENERATE ALL CHORD AUDIO FILES
 # ============================================================
 
 def create_chord_files():
+    """
+    Generate audio files for every chord.
+
+    Returns a dictionary containing
+    each chord and its WAV file path.
+    """
 
     chord_files = {}
 
-    print("\nGenerating 15 guitar chords...\n")
-
     for key, chord in CHORDS.items():
 
-        filename = SOUND_DIR / (
-            chord["name"].replace(" ", "_") + ".wav"
+        filename = (
+
+            SOUND_DIR
+            / f"{chord['name'].replace(' ', '_')}.wav"
         )
 
         generate_chord(
@@ -734,61 +959,128 @@ def create_chord_files():
 
         chord_files[key] = filename
 
-        print("Created:", chord["name"])
 
     return chord_files
 
 
+# ============================================================
+# 11. AUDIO PLAYBACK
+# ============================================================
+
+def stop_chord():
+    """
+    Immediately stop the currently playing audio.
+    """
+
+    winsound.PlaySound(
+        None,
+        winsound.SND_PURGE
+    )
+
+
 def play_chord(chord_key, chord_files):
+    """
+    Play a chord continuously.
 
-    filename = chord_files.get(chord_key)
+    The audio loops until another chord is selected
+    or the hand gesture is released.
+    """
 
-    if filename is not None:
+    filename = chord_files.get(
+        chord_key
+    )
 
-        winsound.PlaySound(
-            str(filename),
-            winsound.SND_FILENAME | winsound.SND_ASYNC
-        )
+    if filename is None:
+
+        return
+
+
+    stop_chord()
+
+    winsound.PlaySound(
+
+        str(filename),
+
+        winsound.SND_FILENAME
+        | winsound.SND_ASYNC
+        | winsound.SND_LOOP,
+    )
 
 
 # ============================================================
 # 12. GESTURE STABILIZATION
 # ============================================================
 
-def get_stable_count(history):
+def stable_count(history):
+    """
+    Return the most frequently detected finger count.
+
+    The result is accepted only when enough recent
+    frames agree with one another.
+    """
 
     if len(history) < HISTORY_SIZE:
 
         return None
 
+
     count, votes = Counter(
         history
     ).most_common(1)[0]
+
 
     if votes >= REQUIRED_VOTES:
 
         return count
 
+
     return None
 
 
+# ============================================================
+# 13. SELECT A CHORD
+# ============================================================
+
 def select_chord(root_count, quality_count):
+    """
+    Convert two finger counts into a chord key.
 
-    root = ROOT_GESTURES.get(root_count)
+    Left hand:
+        Selects root note.
 
-    quality = QUALITY_GESTURES.get(quality_count)
+    Right hand:
+        Selects chord quality.
+    """
+
+    root = ROOT_GESTURES.get(
+        root_count
+    )
+
+    quality = QUALITY_GESTURES.get(
+        quality_count
+    )
+
 
     if root is None or quality is None:
 
         return None
 
-    key = (root, quality)
 
-    return key if key in CHORDS else None
+    key = (
+        root,
+        quality
+    )
+
+    if key not in CHORDS:
+
+        return None
+
+
+    return key
 
 
 # ============================================================
-# 13. ROUNDED PANEL HELPER
+# 14. INTERFACE DRAWING HELPERS
 # ============================================================
 
 def draw_panel(
@@ -797,17 +1089,23 @@ def draw_panel(
     y1,
     x2,
     y2,
-    color,
+    fill,
     border=None,
-    radius=9
+    radius=10
 ):
+    """
+    Draw a rounded rectangular panel.
+    """
 
     if x2 <= x1 or y2 <= y1:
 
         return
 
+
     radius = max(
+
         1,
+
         min(
             radius,
             (x2 - x1) // 2,
@@ -815,1070 +1113,1283 @@ def draw_panel(
         )
     )
 
+
     cv2.rectangle(
+
         image,
+
         (x1 + radius, y1),
+
         (x2 - radius, y2),
-        color,
+
+        fill,
+
         -1
     )
+
 
     cv2.rectangle(
+
         image,
+
         (x1, y1 + radius),
+
         (x2, y2 - radius),
-        color,
+
+        fill,
+
         -1
     )
 
-    cv2.circle(
-        image,
+
+    corners = [
+
         (x1 + radius, y1 + radius),
-        radius,
-        color,
-        -1
-    )
 
-    cv2.circle(
-        image,
         (x2 - radius, y1 + radius),
-        radius,
-        color,
-        -1
-    )
 
-    cv2.circle(
-        image,
         (x1 + radius, y2 - radius),
-        radius,
-        color,
-        -1
-    )
 
-    cv2.circle(
-        image,
         (x2 - radius, y2 - radius),
-        radius,
-        color,
-        -1
-    )
+    ]
+
+
+    for center in corners:
+
+        cv2.circle(
+
+            image,
+
+            center,
+
+            radius,
+
+            fill,
+
+            -1
+        )
+
 
     if border is not None:
 
         cv2.rectangle(
+
             image,
+
             (x1 + radius, y1),
+
             (x2 - radius, y2),
+
             border,
+
             1
         )
 
         cv2.rectangle(
+
             image,
+
             (x1, y1 + radius),
+
             (x2, y2 - radius),
+
             border,
+
             1
         )
 
 
 # ============================================================
-# 14. DRAW FINGER INDICATORS
+# 15. FINGER INDICATORS
 # ============================================================
 
-def draw_finger_pills(frame, x, y, states):
+def draw_finger_indicators(frame, x, y, states):
+    """
+    Display four small indicators for the fingers.
+    """
 
-    names = [
+    fingers = [
+
         ("INDEX", "I"),
+
         ("MIDDLE", "M"),
+
         ("RING", "R"),
-        ("PINKY", "P")
+
+        ("PINKY", "P"),
     ]
 
-    pill_width = 43
-    pill_height = 20
-    gap = 6
 
-    for index, (full_name, short_name) in enumerate(names):
+    for index, (full_name, short_name) in enumerate(
+        fingers
+    ):
 
-        px = x + index * (pill_width + gap)
+        left = x + index * 49
 
-        active = (
-            states is not None
-            and states.get(full_name, False)
+        active = bool(
+            states and states.get(full_name, False)
         )
 
-        fill = (
-            (50, 103, 78)
-            if active
-            else (42, 51, 67)
-        )
 
-        text_color = (
-            SUCCESS
-            if active
-            else TEXT_MUTED
-        )
+        if active:
+
+            fill = (50, 103, 78)
+
+            text_color = COLORS["success"]
+
+        else:
+
+            fill = (42, 51, 67)
+
+            text_color = COLORS["muted"]
+
 
         draw_panel(
+
             frame,
-            px,
+
+            left,
+
             y,
-            px + pill_width,
-            y + pill_height,
+
+            left + 43,
+
+            y + 21,
+
             fill,
-            None,
-            6
+
+            radius=6
         )
 
+
         cv2.putText(
+
             frame,
+
             short_name,
-            (px + 16, y + 14),
+
+            (left + 16, y + 15),
+
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.39,
+
+            0.40,
+
             text_color,
+
             1,
+
             cv2.LINE_AA
         )
 
 
 # ============================================================
-# 15. DRAW HAND STATUS CARDS
+# 16. HAND STATUS CARDS
 # ============================================================
 
 def draw_hand_card(
     frame,
-    x1,
-    y1,
-    x2,
-    y2,
+    bounds,
     title,
     subtitle,
     count,
     states,
     accent
 ):
+    """
+    Draw a card showing the current hand status.
+    """
+
+    x1, y1, x2, y2 = bounds
 
     draw_panel(
+
         frame,
+
         x1,
         y1,
         x2,
         y2,
-        BG_CARD,
-        BORDER,
-        10
+
+        COLORS["card"],
+
+        COLORS["border"],
+
+        12
     )
+
 
     cv2.line(
+
         frame,
-        (x1 + 11, y1 + 9),
-        (x1 + 11, y2 - 9),
+
+        (x1 + 12, y1 + 9),
+
+        (x1 + 12, y2 - 9),
+
         accent,
+
         3,
+
         cv2.LINE_AA
     )
+
 
     cv2.putText(
+
         frame,
+
         title,
-        (x1 + 24, y1 + 24),
+
+        (x1 + 25, y1 + 23),
+
         cv2.FONT_HERSHEY_SIMPLEX,
+
         0.42,
+
         accent,
+
         1,
+
         cv2.LINE_AA
     )
 
-    if count is None:
 
-        count_text = "Waiting for hand..."
+    if count is not None:
 
-        count_color = TEXT_MUTED
+        count_text = (
+            f"{count} fingers detected"
+        )
+
+        count_color = COLORS["text"]
 
     else:
 
-        count_text = f"{count} fingers detected"
+        count_text = "Waiting for hand..."
 
-        count_color = TEXT_MAIN
+        count_color = COLORS["muted"]
+
 
     cv2.putText(
+
         frame,
+
         count_text,
-        (x1 + 24, y1 + 49),
+
+        (x1 + 25, y1 + 48),
+
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.56,
+
+        0.55,
+
         count_color,
+
         2,
+
         cv2.LINE_AA
     )
+
 
     cv2.putText(
+
         frame,
+
         subtitle,
-        (x1 + 24, y1 + 69),
+
+        (x1 + 25, y1 + 68),
+
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.34,
-        TEXT_MUTED,
+
+        0.33,
+
+        COLORS["muted"],
+
         1,
+
         cv2.LINE_AA
     )
 
-    draw_finger_pills(
+
+    draw_finger_indicators(
+
         frame,
-        x1 + 24,
-        y1 + 75,
+
+        x1 + 25,
+
+        y1 + 74,
+
         states
     )
 
 
 # ============================================================
-# 16. CURRENT CHORD HERO PANEL
+# 17. CURRENT CHORD DISPLAY
 # ============================================================
 
-def draw_hero_card(frame, active_chord, panel_top):
+def draw_current_chord(frame, chord_key, top):
+    """
+    Display the selected chord, its notes
+    and its guitar fret shape.
+    """
 
     width = frame.shape[1]
 
     x1 = 18
-    y1 = panel_top + 149
+
+    y1 = top + 151
 
     x2 = width - 18
-    y2 = panel_top + 247
+
+    y2 = top + 230
+
 
     draw_panel(
+
         frame,
+
         x1,
         y1,
         x2,
         y2,
+
         (27, 37, 51),
+
         (71, 95, 109),
+
         12
     )
 
+
     cv2.putText(
+
         frame,
-        "CURRENTLY SELECTED",
-        (x1 + 20, y1 + 23),
+
+        "CURRENT CHORD",
+
+        (x1 + 20, y1 + 20),
+
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.39,
-        ACCENT_MINT,
+
+        0.36,
+
+        COLORS["mint"],
+
         1,
+
         cv2.LINE_AA
     )
 
-    if active_chord is None:
+
+    if chord_key is None:
 
         cv2.putText(
+
             frame,
+
             "Waiting for both hands",
-            (x1 + 20, y1 + 59),
+
+            (x1 + 20, y1 + 53),
+
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            TEXT_MAIN,
+
+            0.72,
+
+            COLORS["text"],
+
             2,
+
             cv2.LINE_AA
         )
 
-        cv2.putText(
-            frame,
-            "Select a root with your left hand and chord quality with your right hand.",
-            (x1 + 20, y1 + 81),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.38,
-            TEXT_MUTED,
-            1,
-            cv2.LINE_AA
-        )
 
         cv2.putText(
+
             frame,
-            "15 CHORDS",
-            (x2 - 145, y1 + 63),
+
+            "Left hand selects the root; right hand selects the chord type.",
+
+            (x1 + 20, y1 + 73),
+
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            ACCENT_GOLD,
+
+            0.37,
+
+            COLORS["muted"],
+
             1,
+
             cv2.LINE_AA
         )
 
         return
 
-    chord = CHORDS[active_chord]
+
+    chord = CHORDS[chord_key]
+
 
     cv2.putText(
+
         frame,
+
         chord["name"],
-        (x1 + 20, y1 + 58),
+
+        (x1 + 20, y1 + 56),
+
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.85,
-        TEXT_MAIN,
+
+        0.82,
+
+        COLORS["text"],
+
         2,
+
         cv2.LINE_AA
     )
 
+
     cv2.putText(
+
         frame,
-        "NOTES: " + chord["notes"],
-        (x1 + 22, y1 + 81),
+
+        f"NOTES: {chord['notes']}",
+
+        (x1 + 22, y1 + 75),
+
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.39,
-        TEXT_MUTED,
+
+        0.38,
+
+        COLORS["muted"],
+
         1,
+
         cv2.LINE_AA
     )
 
+
     cv2.putText(
+
         frame,
+
         "GUITAR FRET SHAPE",
-        (x2 - 220, y1 + 26),
+
+        (x2 - 215, y1 + 24),
+
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.35,
-        ACCENT_GOLD,
+
+        0.34,
+
+        COLORS["gold"],
+
         1,
+
         cv2.LINE_AA
     )
 
+
     cv2.putText(
+
         frame,
+
         chord["fret"],
-        (x2 - 220, y1 + 65),
+
+        (x2 - 215, y1 + 62),
+
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.85,
-        ACCENT_GOLD,
+
+        0.82,
+
+        COLORS["gold"],
+
         2,
+
         cv2.LINE_AA
     )
+
 
     cv2.putText(
+
         frame,
+
         "Low E to high E",
-        (x2 - 220, y1 + 82),
+
+        (x2 - 215, y1 + 77),
+
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.32,
-        TEXT_MUTED,
+
+        0.30,
+
+        COLORS["muted"],
+
         1,
+
         cv2.LINE_AA
     )
 
 
 # ============================================================
-# 17. DRAW CHORD LIBRARY
+# 18. CHORD LIBRARY
 # ============================================================
 
-def draw_chord_library(frame, active_chord, panel_top):
+def draw_chord_library(frame, active_chord, top):
+    """
+    Display all 15 available chords.
+
+    The currently selected chord is highlighted.
+    """
 
     width = frame.shape[1]
 
     x1 = 18
-    y1 = panel_top + 255
+
+    y1 = top + 236
 
     x2 = width - 18
-    y2 = panel_top + 397
+
+    y2 = top + 326
+
 
     draw_panel(
+
         frame,
+
         x1,
         y1,
         x2,
         y2,
-        BG_MAIN,
-        BORDER,
-        10
+
+        COLORS["background"],
+
+        COLORS["border"],
+
+        9
     )
 
-    cv2.putText(
-        frame,
-        "CHORD LIBRARY",
-        (x1 + 14, y1 + 18),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.40,
-        TEXT_MAIN,
-        1,
-        cv2.LINE_AA
-    )
 
-    root_order = ["C", "G", "D", "A", "E"]
+    roots = [
+        "C",
+        "G",
+        "D",
+        "A",
+        "E"
+    ]
 
-    quality_order = [
+    qualities = [
         "MAJOR",
         "MINOR",
         "7TH"
     ]
 
+
     root_counts = {
+
         "C": 1,
+
         "G": 2,
+
         "D": 3,
+
         "A": 4,
+
         "E": 0
     }
 
+
     quality_counts = {
+
         "MAJOR": 1,
+
         "MINOR": 2,
+
         "7TH": 3
     }
 
-    grid_x = x1 + 9
-    grid_y = y1 + 25
 
-    grid_width = x2 - x1 - 18
-    grid_height = y2 - grid_y - 5
+    grid_x = x1 + 8
 
-    cell_width = grid_width // 5
-    cell_height = grid_height // 3
+    grid_y = y1 + 6
 
-    for row, quality in enumerate(quality_order):
+    cell_width = (
+        (x2 - x1 - 16) // 5
+    )
 
-        for column, root in enumerate(root_order):
+    cell_height = (
+        (y2 - y1 - 12) // 3
+    )
 
-            key = (root, quality)
+
+    for row, quality in enumerate(qualities):
+
+        for column, root in enumerate(roots):
+
+            key = (
+                root,
+                quality
+            )
 
             chord = CHORDS[key]
 
-            cx1 = grid_x + column * cell_width + 2
 
-            cx2 = grid_x + (column + 1) * cell_width - 2
+            left = (
+                grid_x
+                + column * cell_width
+                + 2
+            )
 
-            cy1 = grid_y + row * cell_height + 2
+            right = (
+                grid_x
+                + (column + 1) * cell_width
+                - 2
+            )
 
-            cy2 = grid_y + (row + 1) * cell_height - 2
+            upper = (
+                grid_y
+                + row * cell_height
+                + 1
+            )
 
-            active = key == active_chord
+            lower = (
+                grid_y
+                + (row + 1) * cell_height
+                - 1
+            )
 
-            if active:
 
-                card_color = BG_CARD_ACTIVE
+            selected = (
+                key == active_chord
+            )
 
-                card_border = ACCENT_MINT
+
+            if selected:
+
+                fill = COLORS["active"]
+
+                border = COLORS["mint"]
 
                 name_color = (190, 255, 220)
 
             else:
 
-                card_color = BG_CARD
+                fill = COLORS["card"]
 
-                card_border = (48, 61, 79)
+                border = COLORS["border"]
 
-                name_color = TEXT_MAIN
+                name_color = COLORS["text"]
+
 
             draw_panel(
+
                 frame,
-                cx1,
-                cy1,
-                cx2,
-                cy2,
-                card_color,
-                card_border,
-                6
+
+                left,
+                upper,
+                right,
+                lower,
+
+                fill,
+
+                border,
+
+                5
             )
 
+
             cv2.putText(
+
                 frame,
+
                 chord["name"],
-                (cx1 + 7, cy1 + 14),
+
+                (left + 6, upper + 11),
+
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.35,
+
+                0.30,
+
                 name_color,
+
                 1,
+
                 cv2.LINE_AA
             )
 
-            gesture = (
-                f"LEFT {root_counts[root]} / RIGHT {quality_counts[quality]}"
+
+            control = (
+
+                f"LEFT {root_counts[root]} "
+                f"/ RIGHT {quality_counts[quality]}"
             )
 
-            cv2.putText(
-                frame,
-                gesture,
-                (cx1 + 7, cy1 + 29),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.29,
-                ACCENT_BLUE,
-                1,
-                cv2.LINE_AA
-            )
 
             cv2.putText(
+
                 frame,
-                chord["notes"] + " | " + chord["fret"],
-                (cx1 + 7, cy1 + 43),
+
+                control,
+
+                (left + 6, upper + 22),
+
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.27,
-                TEXT_MUTED,
+
+                0.25,
+
+                COLORS["blue"],
+
                 1,
+
                 cv2.LINE_AA
             )
 
 
 # ============================================================
-# 18. COMPLETE RESPONSIVE CAMERA INTERFACE
+# 19. COMPLETE DISPLAY
 # ============================================================
 
-def draw_interface(
-    frame,
-    root_count,
-    quality_count,
-    root_states,
-    quality_states,
-    active_chord,
-    fps,
-    hand_count,
-    debug_mode,
-    root_diagnostics=None,
-    quality_diagnostics=None
-):
+def compose_display(camera_frame, state, fps):
+    """
+    Combine the webcam and the dashboard.
 
-    # Create a fixed landscape canvas.
-    # The camera image is fitted without stretching.
+    The camera keeps its original proportions.
+    The dashboard is placed underneath it.
+    """
 
     canvas = np.zeros(
+
         (
             DISPLAY_HEIGHT,
             DISPLAY_WIDTH,
             3
         ),
+
         dtype=np.uint8
     )
 
-    canvas[:] = BG_MAIN
+    canvas[:] = COLORS["background"]
 
-    frame_height, frame_width = frame.shape[:2]
+
+    source_height, source_width = (
+        camera_frame.shape[:2]
+    )
+
+
+    # Scale the camera image without stretching it.
 
     scale = min(
-        DISPLAY_WIDTH / frame_width,
-        DISPLAY_HEIGHT / frame_height
+
+        DISPLAY_WIDTH / source_width,
+
+        CAMERA_VIEW_HEIGHT / source_height
     )
 
-    new_width = int(
-        frame_width * scale
+
+    target_width = int(
+        source_width * scale
     )
 
-    new_height = int(
-        frame_height * scale
+    target_height = int(
+        source_height * scale
     )
 
-    # Resize while preserving aspect ratio.
-    resized_frame = cv2.resize(
-        frame,
-        (new_width, new_height),
+
+    resized = cv2.resize(
+
+        camera_frame,
+
+        (target_width, target_height),
+
         interpolation=cv2.INTER_AREA
     )
 
-    # Center the complete camera image.
+
+    # Create a blurred background to fill
+    # any empty side areas.
+
+    background_scale = max(
+
+        DISPLAY_WIDTH / source_width,
+
+        CAMERA_VIEW_HEIGHT / source_height
+    )
+
+
+    background_width = int(
+        source_width * background_scale
+    )
+
+    background_height = int(
+        source_height * background_scale
+    )
+
+
+    enlarged = cv2.resize(
+
+        camera_frame,
+
+        (background_width, background_height)
+    )
+
+
+    crop_x = (
+        background_width - DISPLAY_WIDTH
+    ) // 2
+
+    crop_y = (
+        background_height - CAMERA_VIEW_HEIGHT
+    ) // 2
+
+
+    camera_background = enlarged[
+
+        crop_y:crop_y + CAMERA_VIEW_HEIGHT,
+
+        crop_x:crop_x + DISPLAY_WIDTH
+
+    ].copy()
+
+
+    camera_background = cv2.GaussianBlur(
+
+        camera_background,
+
+        (0, 0),
+
+        22
+    )
+
+
+    camera_background = (
+
+        camera_background.astype(np.float32)
+        * 0.30
+
+    ).astype(np.uint8)
+
+
     offset_x = (
-        DISPLAY_WIDTH - new_width
+        DISPLAY_WIDTH - target_width
     ) // 2
 
     offset_y = (
-        DISPLAY_HEIGHT - new_height
+        CAMERA_VIEW_HEIGHT - target_height
     ) // 2
 
-    canvas[
-        offset_y:offset_y + new_height,
-        offset_x:offset_x + new_width
-    ] = resized_frame
 
-    # ========================================================
-    # TOP HEADER
-    # ========================================================
+    camera_background[
 
-    header_overlay = canvas.copy()
+        offset_y:offset_y + target_height,
+
+        offset_x:offset_x + target_width
+
+    ] = resized
+
+
+    canvas[:CAMERA_VIEW_HEIGHT] = (
+        camera_background
+    )
+
+
+    # ---------------- DASHBOARD HEADER ----------------
+
+    top = CAMERA_VIEW_HEIGHT
 
     cv2.rectangle(
-        header_overlay,
-        (0, 0),
-        (DISPLAY_WIDTH, 67),
-        BG_PANEL,
+
+        canvas,
+
+        (0, top),
+
+        (DISPLAY_WIDTH, top + 39),
+
+        COLORS["panel"],
+
         -1
     )
 
-    cv2.addWeighted(
-        header_overlay,
-        0.92,
-        canvas,
-        0.08,
-        0,
-        canvas
-    )
 
     cv2.line(
-        canvas,
-        (0, 66),
-        (DISPLAY_WIDTH, 66),
-        ACCENT_MINT,
-        2
-    )
 
-    # Brand icon
-    cv2.circle(
         canvas,
-        (27, 27),
-        10,
-        ACCENT_MINT,
-        -1,
-        cv2.LINE_AA
-    )
 
-    cv2.circle(
-        canvas,
-        (27, 27),
-        4,
-        BG_PANEL,
-        -1,
-        cv2.LINE_AA
-    )
+        (0, top),
 
-    # Title
-    cv2.putText(
-        canvas,
-        PROJECT_NAME,
-        (47, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.60,
-        TEXT_MAIN,
+        (DISPLAY_WIDTH, top),
+
+        COLORS["mint"],
+
         2,
+
         cv2.LINE_AA
     )
 
-    cv2.putText(
+
+    cv2.circle(
+
         canvas,
+
+        (22, top + 20),
+
+        7,
+
+        COLORS["mint"],
+
+        -1,
+
+        cv2.LINE_AA
+    )
+
+
+    cv2.putText(
+
+        canvas,
+
+        PROJECT_NAME,
+
+        (40, top + 25),
+
+        cv2.FONT_HERSHEY_SIMPLEX,
+
+        0.48,
+
+        COLORS["text"],
+
+        2,
+
+        cv2.LINE_AA
+    )
+
+
+    cv2.putText(
+
+        canvas,
+
         "TWO-HAND PERFORMANCE MODE",
-        (48, 46),
+
+        (265, top + 24),
+
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.32,
-        TEXT_MUTED,
+
+        0.34,
+
+        COLORS["muted"],
+
         1,
+
         cv2.LINE_AA
     )
 
-    # Root status
-    root_name = (
-        ROOT_GESTURES.get(root_count, "INVALID")
-        if root_count is not None
-        else "WAITING"
+
+    hands_text = (
+        f"{state['hand_count']}/2 HANDS TRACKED"
     )
 
-    draw_panel(
-        canvas,
-        420,
-        12,
-        605,
-        53,
-        BG_CARD,
-        BORDER,
-        9
-    )
 
-    cv2.putText(
-        canvas,
-        "ROOT HAND",
-        (433, 25),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.31,
-        ACCENT_MINT,
-        1
-    )
+    if state["hand_count"] == 2:
 
-    cv2.putText(
-        canvas,
-        root_name,
-        (433, 43),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.48,
-        TEXT_MAIN,
-        1
-    )
-
-    # Quality status
-    quality_name = (
-        QUALITY_GESTURES.get(quality_count, "INVALID")
-        if quality_count is not None
-        else "WAITING"
-    )
-
-    draw_panel(
-        canvas,
-        619,
-        12,
-        812,
-        53,
-        BG_CARD,
-        BORDER,
-        9
-    )
-
-    cv2.putText(
-        canvas,
-        "CHORD QUALITY",
-        (632, 25),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.31,
-        ACCENT_BLUE,
-        1
-    )
-
-    cv2.putText(
-        canvas,
-        quality_name,
-        (632, 43),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.48,
-        TEXT_MAIN,
-        1
-    )
-
-    # Hand count and FPS
-    cv2.putText(
-        canvas,
-        f"{hand_count}/2 HANDS",
-        (1000, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.43,
-        SUCCESS if hand_count == 2 else WARNING,
-        1
-    )
-
-    cv2.putText(
-        canvas,
-        f"{fps:.0f} FPS",
-        (1000, 47),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.34,
-        TEXT_MUTED,
-        1
-    )
-
-    # ========================================================
-    # BOTTOM TRANSLUCENT CHORD PANEL
-    # ========================================================
-
-    panel_top = 542
-
-    overlay = canvas.copy()
-
-    cv2.rectangle(
-        overlay,
-        (0, panel_top),
-        (DISPLAY_WIDTH, DISPLAY_HEIGHT),
-        BG_PANEL,
-        -1
-    )
-
-    cv2.addWeighted(
-        overlay,
-        0.94,
-        canvas,
-        0.06,
-        0,
-        canvas
-    )
-
-    # Panel accent
-    cv2.line(
-        canvas,
-        (0, panel_top),
-        (DISPLAY_WIDTH, panel_top),
-        ACCENT_MINT,
-        2
-    )
-
-    # ========================================================
-    # CURRENT CHORD INFORMATION
-    # ========================================================
-
-    if active_chord is not None:
-
-        chord = CHORDS[active_chord]
-
-        current_text = chord["name"]
-
-        cv2.putText(
-            canvas,
-            current_text,
-            (18, panel_top + 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.57,
-            SUCCESS,
-            2,
-            cv2.LINE_AA
-        )
-
-        cv2.putText(
-            canvas,
-            f"NOTES: {chord['notes']}     GUITAR: {chord['fret']}",
-            (215, panel_top + 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.39,
-            TEXT_MUTED,
-            1,
-            cv2.LINE_AA
-        )
+        hands_color = COLORS["success"]
 
     else:
 
-        cv2.putText(
-            canvas,
-            "CHORD LIBRARY",
-            (18, panel_top + 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            TEXT_MAIN,
-            1,
-            cv2.LINE_AA
-        )
+        hands_color = COLORS["warning"]
 
-        cv2.putText(
-            canvas,
-            "15 combinations  |  Select using both hands",
-            (215, panel_top + 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.39,
-            TEXT_MUTED,
-            1,
-            cv2.LINE_AA
-        )
 
     cv2.putText(
+
         canvas,
-        "Q QUIT  |  D DEBUG  |  R RESET  |  SPACE REPLAY",
-        (900, panel_top + 24),
+
+        hands_text,
+
+        (DISPLAY_WIDTH - 180, top + 24),
+
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.30,
-        TEXT_MUTED,
+
+        0.35,
+
+        hands_color,
+
         1,
+
         cv2.LINE_AA
     )
 
-    # ========================================================
-    # FIVE COLUMNS, THREE ROWS
-    # ========================================================
 
-    root_order = ["C", "G", "D", "A", "E"]
+    # ---------------- HAND STATUS CARDS ----------------
 
-    quality_order = [
-        "MAJOR",
-        "MINOR",
-        "7TH"
-    ]
+    margin = 18
 
-    root_counts = {
-        "C": 1,
-        "G": 2,
-        "D": 3,
-        "A": 4,
-        "E": 0
-    }
+    gap = 14
 
-    quality_counts = {
-        "MAJOR": 1,
-        "MINOR": 2,
-        "7TH": 3
-    }
+    card_width = (
 
-    grid_x = 14
-    grid_y = panel_top + 38
+        DISPLAY_WIDTH
+        - 2 * margin
+        - gap
 
-    grid_width = DISPLAY_WIDTH - 28
+    ) // 2
 
-    grid_height = DISPLAY_HEIGHT - grid_y - 8
 
-    column_width = grid_width // 5
+    card_top = top + 45
 
-    row_height = grid_height // 3
+    card_bottom = top + 143
 
-    for row, quality in enumerate(quality_order):
 
-        for column, root in enumerate(root_order):
+    draw_hand_card(
 
-            key = (root, quality)
+        canvas,
 
-            chord = CHORDS[key]
+        (
 
-            x1 = grid_x + column * column_width + 3
+            margin,
 
-            x2 = grid_x + (column + 1) * column_width - 3
+            card_top,
 
-            y1 = grid_y + row * row_height + 2
+            margin + card_width,
 
-            y2 = grid_y + (row + 1) * row_height - 2
+            card_bottom
+        ),
 
-            selected = key == active_chord
+        "01  ROOT SELECTOR - SCREEN LEFT",
 
-            if selected:
+        "Fist E  |  1 C  |  2 G  |  3 D  |  4 A",
 
-                card_color = BG_CARD_ACTIVE
+        state["root_count"],
 
-                border_color = ACCENT_MINT
+        state["root_states"],
 
-                name_color = (195, 255, 220)
+        COLORS["mint"]
+    )
 
-            else:
 
-                card_color = BG_CARD
+    right_left = (
+        margin + card_width + gap
+    )
 
-                border_color = BORDER
 
-                name_color = TEXT_MAIN
+    draw_hand_card(
 
-            draw_panel(
-                canvas,
-                x1,
-                y1,
-                x2,
-                y2,
-                card_color,
-                border_color,
-                8
-            )
+        canvas,
 
-            # Chord name
-            cv2.putText(
-                canvas,
-                chord["name"],
-                (x1 + 9, y1 + 18),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.43,
-                name_color,
-                1,
-                cv2.LINE_AA
-            )
+        (
 
-            # Gesture
-            control = (
-                f"LEFT {root_counts[root]}   /   "
-                f"RIGHT {quality_counts[quality]}"
-            )
+            right_left,
 
-            cv2.putText(
-                canvas,
-                control,
-                (x1 + 9, y1 + 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.34,
-                ACCENT_BLUE,
-                1,
-                cv2.LINE_AA
-            )
+            card_top,
 
-            # Notes and guitar fret
-            detail = (
-                chord["notes"] + "     " + chord["fret"]
-            )
+            DISPLAY_WIDTH - margin,
 
-            cv2.putText(
-                canvas,
-                detail,
-                (x1 + 9, y1 + 50),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.34,
-                TEXT_MUTED,
-                1,
-                cv2.LINE_AA
-            )
+            card_bottom
+        ),
 
-    # ========================================================
-    # DEBUG INFORMATION
-    # ========================================================
+        "02  CHORD QUALITY - SCREEN RIGHT",
 
-    if debug_mode:
+        "1 Major  |  2 Minor  |  3 Dominant 7th",
 
-        debug_overlay = canvas.copy()
+        state["quality_count"],
+
+        state["quality_states"],
+
+        COLORS["blue"]
+    )
+
+
+    # ---------------- CURRENT CHORD ----------------
+
+    draw_current_chord(
+
+        canvas,
+
+        state["active_chord"],
+
+        top
+    )
+
+
+    # ---------------- CHORD LIBRARY ----------------
+
+    draw_chord_library(
+
+        canvas,
+
+        state["active_chord"],
+
+        top
+    )
+
+
+    # ---------------- FOOTER ----------------
+
+    footer_y = DISPLAY_HEIGHT - 7
+
+
+    cv2.putText(
+
+        canvas,
+
+        "Q QUIT     D DIAGNOSTICS     R RESET     SPACE REPLAY",
+
+        (18, footer_y),
+
+        cv2.FONT_HERSHEY_SIMPLEX,
+
+        0.29,
+
+        COLORS["muted"],
+
+        1,
+
+        cv2.LINE_AA
+    )
+
+
+    cv2.putText(
+
+        canvas,
+
+        f"{fps:.0f} FPS",
+
+        (DISPLAY_WIDTH - 75, footer_y),
+
+        cv2.FONT_HERSHEY_SIMPLEX,
+
+        0.29,
+
+        COLORS["gold"],
+
+        1,
+
+        cv2.LINE_AA
+    )
+
+
+    # ---------------- DEBUG INFORMATION ----------------
+
+    if state["debug_mode"]:
+
+        overlay = canvas.copy()
+
 
         cv2.rectangle(
-            debug_overlay,
-            (DISPLAY_WIDTH - 280, 80),
-            (DISPLAY_WIDTH - 8, 280),
-            BG_PANEL,
+
+            overlay,
+
+            (DISPLAY_WIDTH - 265, 12),
+
+            (DISPLAY_WIDTH - 8, 145),
+
+            COLORS["panel"],
+
             -1
         )
 
+
         cv2.addWeighted(
-            debug_overlay,
+
+            overlay,
+
             0.90,
+
             canvas,
+
             0.10,
+
             0,
+
             canvas
         )
 
-        y = 103
 
-        for label, diagnostics in [
-            ("ROOT", root_diagnostics),
-            ("TYPE", quality_diagnostics)
-        ]:
+        y = 32
+
+
+        for label, diagnostics in (
+
+            ("LEFT", state["root_diagnostics"]),
+
+            ("RIGHT", state["quality_diagnostics"])
+
+        ):
 
             if not diagnostics:
+
                 continue
+
 
             for finger, info in diagnostics.items():
 
                 message = (
+
                     f"{label} {finger}: "
-                    f"{info['score']:.2f}  "
+                    f"{info['score']:.2f} "
                     f"PIP {info['pip']:.0f}"
                 )
 
+
                 cv2.putText(
+
                     canvas,
+
                     message,
-                    (DISPLAY_WIDTH - 268, y),
+
+                    (DISPLAY_WIDTH - 253, y),
+
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.30,
-                    TEXT_MAIN,
-                    1
+
+                    0.29,
+
+                    COLORS["text"],
+
+                    1,
+
+                    cv2.LINE_AA
                 )
 
-                y += 17
+
+                y += 15
+
 
     return canvas
 
 
 # ============================================================
-# 19. MAIN APPLICATION
+# 20. MAIN APPLICATION
 # ============================================================
 
-def main():
+def run_application():
+    """
+    Initialize the webcam, MediaPipe detector,
+    chord audio and main application loop.
+    """
 
     camera = None
 
     detector = None
 
+    chord_files = {}
+
+    playing_chord = None
+
+    last_valid_chord_time = 0.0
+
+
     try:
 
-        print("\n======================================")
-        print("          AI VIRTUAL GUITAR")
-        print("======================================")
+        print("\nAI Virtual Guitar")
 
-        # Create musical sounds
-        chord_files = {}
+        print("-----------------")
 
-        print("\nGenerating guitar chords...\n")
+        print("Preparing chord audio...")
 
-        for key, chord in CHORDS.items():
 
-            filename = SOUND_DIR / (
-                chord["name"].replace(" ", "_") + ".wav"
-            )
+        # Generate all chord audio files.
 
-            generate_chord(
-                chord["frequencies"],
-                filename
-            )
+        chord_files = create_chord_files()
 
-            chord_files[key] = filename
 
-            print("Created:", chord["name"])
+        # Open the webcam.
 
-        # Initialize webcam
         camera = cv2.VideoCapture(
             CAMERA_INDEX,
             cv2.CAP_DSHOW
         )
+
 
         if not camera.isOpened():
 
@@ -1886,54 +2397,76 @@ def main():
                 CAMERA_INDEX
             )
 
+
         if not camera.isOpened():
 
             raise RuntimeError(
-                "Could not open webcam."
+                "Could not open webcam. "
+                "Check camera access and CAMERA_INDEX."
             )
 
+
         camera.set(
+
             cv2.CAP_PROP_FRAME_WIDTH,
+
             CAMERA_WIDTH
         )
 
+
         camera.set(
+
             cv2.CAP_PROP_FRAME_HEIGHT,
+
             CAMERA_HEIGHT
         )
 
+
         camera.set(
+
             cv2.CAP_PROP_BUFFERSIZE,
+
             1
         )
 
-        # Initialize MediaPipe
+
+        # Initialize MediaPipe.
+
         detector = create_hand_detector()
 
-        # Create window
+
         cv2.namedWindow(
+
             WINDOW_NAME,
+
             cv2.WINDOW_NORMAL
         )
 
+
         cv2.resizeWindow(
+
             WINDOW_NAME,
-            DISPLAY_WIDTH,
-            DISPLAY_HEIGHT
+
+            1050,
+
+            738
         )
 
-        print("\nVirtual guitar is ready.")
 
-        print("LEFT HAND = ROOT")
-        print("RIGHT HAND = CHORD QUALITY")
+        print("\nReady.")
 
-        print("\nKEYBOARD:")
-        print("Q = Quit")
-        print("D = Diagnostics")
-        print("R = Reset")
-        print("SPACE = Replay chord")
+        print("Screen-left hand: chord root.")
 
-        # Gesture histories
+        print("Screen-right hand: chord quality.")
+
+        print(
+            "Q: quit | D: diagnostics | "
+            "R: reset | SPACE: replay"
+        )
+
+
+        # Store recent finger counts.
+
         root_history = deque(
             maxlen=HISTORY_SIZE
         )
@@ -1942,38 +2475,35 @@ def main():
             maxlen=HISTORY_SIZE
         )
 
-        # Finger states
-        root_finger_states = {
+
+        # Initial finger states.
+
+        root_states = {
 
             name: False
 
             for name in FINGER_LANDMARKS
-
         }
 
-        quality_finger_states = {
+
+        quality_states = {
 
             name: False
 
             for name in FINGER_LANDMARKS
-
         }
 
-        active_chord = None
-
-        previous_chord = None
-
-        last_play_time = 0.0
 
         previous_timestamp = -1
 
         previous_frame_time = time.perf_counter()
 
-        fps_history = deque(
-            maxlen=15
-        )
+        fps_history = deque(maxlen=15)
 
         debug_mode = False
+
+        active_chord = None
+
 
         # ====================================================
         # MAIN LOOP
@@ -1981,93 +2511,50 @@ def main():
 
         while True:
 
-            # Read webcam
+            # Read webcam frame.
+
             success, frame = camera.read()
+
 
             if not success:
 
-                print("Could not read camera frame.")
+                raise RuntimeError(
+                    "Could not read a frame from the webcam."
+                )
 
-                break
 
-            # Mirror webcam
+            # Mirror the frame for natural interaction.
+
             frame = cv2.flip(
                 frame,
                 1
             )
 
-            # Prepare image
-            rgb_frame = cv2.cvtColor(
-                frame,
-                cv2.COLOR_BGR2RGB
-            )
 
-            rgb_frame = np.ascontiguousarray(
-                rgb_frame
-            )
-
-            mp_image = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=rgb_frame
-            )
-
-            # Increasing timestamp
-            timestamp = int(
-                time.perf_counter() * 1000
-            )
+            # MediaPipe VIDEO mode requires
+            # an increasing timestamp.
 
             timestamp = max(
-                timestamp,
+
+                int(time.perf_counter() * 1000),
+
                 previous_timestamp + 1
             )
 
             previous_timestamp = timestamp
 
-            # Detect both hands
-            result = detector.detect_for_video(
-                mp_image,
+
+            # Detect hands.
+
+            hands = detect_hands(
+
+                detector,
+
+                frame,
+
                 timestamp
             )
 
-            detected_hands = []
-
-            if result.hand_landmarks:
-
-                for index, image_landmarks in enumerate(
-                    result.hand_landmarks
-                ):
-
-                    if (
-                        not result.hand_world_landmarks
-                        or index >= len(result.hand_world_landmarks)
-                    ):
-
-                        continue
-
-                    world_landmarks = (
-                        result.hand_world_landmarks[index]
-                    )
-
-                    center_x = np.mean(
-                        [
-                            landmark.x
-
-                            for landmark in image_landmarks
-                        ]
-                    )
-
-                    detected_hands.append(
-                        (
-                            center_x,
-                            image_landmarks,
-                            world_landmarks
-                        )
-                    )
-
-            # Sort by screen position
-            detected_hands.sort(
-                key=lambda item: item[0]
-            )
 
             root_count = None
 
@@ -2079,63 +2566,84 @@ def main():
 
             active_chord = None
 
+
             # =================================================
             # PROCESS BOTH HANDS
             # =================================================
 
-            if len(detected_hands) >= 2:
+            if len(hands) >= 2:
 
-                # Screen-left hand = root
-                (
-                    _,
-                    root_image,
-                    root_world
-                ) = detected_hands[0]
+                # Hands are sorted from left to right.
 
-                # Screen-right hand = quality
-                (
-                    _,
-                    quality_image,
-                    quality_world
-                ) = detected_hands[1]
+                _, root_image, root_world = hands[0]
 
-                # Recognize left hand
+                _, quality_image, quality_world = hands[1]
+
+
+                # Recognize fingers on the left hand.
+
                 (
+
                     root_count,
-                    root_finger_states,
+
+                    root_states,
+
                     root_diagnostics
+
                 ) = recognize_fingers(
+
                     root_world,
-                    root_finger_states
+
+                    root_states
                 )
 
-                # Recognize right hand
+
+                # Recognize fingers on the right hand.
+
                 (
+
                     quality_count,
-                    quality_finger_states,
+
+                    quality_states,
+
                     quality_diagnostics
+
                 ) = recognize_fingers(
+
                     quality_world,
-                    quality_finger_states
+
+                    quality_states
                 )
 
-                # Draw left hand
+
+                # Draw both hand skeletons.
+
                 draw_hand(
+
                     frame,
+
                     root_image,
-                    root_finger_states,
+
+                    root_states,
+
                     "ROOT"
                 )
 
-                # Draw right hand
+
                 draw_hand(
+
                     frame,
+
                     quality_image,
-                    quality_finger_states,
+
+                    quality_states,
+
                     "QUALITY"
                 )
 
-                # Stabilize gestures
+
+                # Store recent finger counts.
+
                 root_history.append(
                     root_count
                 )
@@ -2144,80 +2652,131 @@ def main():
                     quality_count
                 )
 
-                stable_root = get_stable_count(
+
+                # Stabilize recognition.
+
+                stable_root = stable_count(
                     root_history
                 )
 
-                stable_quality = get_stable_count(
+                stable_quality = stable_count(
                     quality_history
                 )
 
-                # Select chord
+
+                # Select a chord when both hands
+                # have stable gesture counts.
+
                 if (
+
                     stable_root is not None
 
                     and stable_quality is not None
+
                 ):
 
                     active_chord = select_chord(
+
                         stable_root,
+
                         stable_quality
                     )
 
+
             else:
 
-                # Reset if two hands are not present
+                # Reset recognition when both hands
+                # are no longer available.
+
                 root_history.clear()
 
                 quality_history.clear()
 
-                for name in FINGER_LANDMARKS:
 
-                    root_finger_states[name] = False
+                root_states = {
 
-                    quality_finger_states[name] = False
+                    name: False
+
+                    for name in FINGER_LANDMARKS
+                }
+
+
+                quality_states = {
+
+                    name: False
+
+                    for name in FINGER_LANDMARKS
+                }
+
 
             # =================================================
-            # PLAY CHORD
+            # SUSTAIN AND RELEASE AUDIO
             # =================================================
 
-            current_time = time.time()
+            now = time.monotonic()
+
 
             if active_chord is not None:
 
-                if (
-                    active_chord != previous_chord
+                # Keep track of the last valid gesture.
 
-                    and current_time - last_play_time >= CHORD_COOLDOWN
-                ):
+                last_valid_chord_time = now
+
+
+                # Change audio only when the chord changes.
+
+                if active_chord != playing_chord:
 
                     play_chord(
+
                         active_chord,
+
                         chord_files
                     )
 
+
+                    playing_chord = active_chord
+
+
                     print(
+
                         "Playing:",
+
                         CHORDS[active_chord]["name"]
                     )
 
-                    previous_chord = active_chord
 
-                    last_play_time = current_time
+            elif (
 
-            else:
+                playing_chord is not None
 
-                previous_chord = None
+                and now - last_valid_chord_time
+                >= RELEASE_GRACE_SECONDS
+
+            ):
+
+                # Stop audio after the gesture
+                # has been missing for long enough.
+
+                stop_chord()
+
+                print("Chord released.")
+
+                playing_chord = None
+
 
             # =================================================
-            # FPS
+            # FPS CALCULATION
             # =================================================
 
-            now = time.perf_counter()
+            frame_time = time.perf_counter()
 
-            elapsed = now - previous_frame_time
+            elapsed = (
+                frame_time - previous_frame_time
+            )
 
-            previous_frame_time = now
+            previous_frame_time = frame_time
+
 
             if elapsed > 0:
 
@@ -2225,43 +2784,83 @@ def main():
                     1.0 / elapsed
                 )
 
-            fps = (
-                sum(fps_history) / len(fps_history)
 
-                if fps_history
+            if fps_history:
 
-                else 0.0
-            )
+                fps = (
+                    sum(fps_history)
+                    / len(fps_history)
+                )
+
+            else:
+
+                fps = 0.0
+
 
             # =================================================
-            # RENDER INTERFACE
+            # DISPLAY STATE
             # =================================================
 
-            display = draw_interface(
+            state = {
+
+                "hand_count": len(hands),
+
+                "root_count": root_count,
+
+                "quality_count": quality_count,
+
+
+                "root_states": (
+
+                    root_states
+                    if len(hands) >= 2
+                    else None
+                ),
+
+
+                "quality_states": (
+
+                    quality_states
+                    if len(hands) >= 2
+                    else None
+                ),
+
+
+                "active_chord": (
+
+                    active_chord
+                    if active_chord is not None
+                    else playing_chord
+                ),
+
+
+                "root_diagnostics": root_diagnostics,
+
+                "quality_diagnostics": quality_diagnostics,
+
+                "debug_mode": debug_mode,
+            }
+
+
+            # Build and show the interface.
+
+            display = compose_display(
+
                 frame,
-                root_count,
-                quality_count,
 
-                root_finger_states
-                if len(detected_hands) >= 2
-                else None,
+                state,
 
-                quality_finger_states
-                if len(detected_hands) >= 2
-                else None,
-
-                active_chord,
-                fps,
-                len(detected_hands),
-                debug_mode,
-                root_diagnostics,
-                quality_diagnostics
+                fps
             )
+
 
             cv2.imshow(
+
                 WINDOW_NAME,
+
                 display
             )
+
 
             # =================================================
             # KEYBOARD CONTROLS
@@ -2269,18 +2868,22 @@ def main():
 
             key = cv2.waitKey(1) & 0xFF
 
+
+            # Quit.
+
             if key == ord("q"):
 
                 break
 
-            elif key == ord("d"):
+
+            # Toggle diagnostics.
+
+            if key == ord("d"):
 
                 debug_mode = not debug_mode
 
-                print(
-                    "Diagnostics:",
-                    "ON" if debug_mode else "OFF"
-                )
+
+            # Reset gesture recognition.
 
             elif key == ord("r"):
 
@@ -2288,76 +2891,116 @@ def main():
 
                 quality_history.clear()
 
+
+                root_states = {
+
+                    name: False
+
+                    for name in FINGER_LANDMARKS
+                }
+
+
+                quality_states = {
+
+                    name: False
+
+                    for name in FINGER_LANDMARKS
+                }
+
+
                 active_chord = None
 
-                previous_chord = None
+                playing_chord = None
 
-                print("Gesture recognition reset.")
+                last_valid_chord_time = 0.0
+
+
+                stop_chord()
+
+
+                print(
+                    "Gesture recognition reset; audio stopped."
+                )
+
+
+            # Replay the currently selected chord.
 
             elif key == 32:
 
-                if active_chord is not None:
+                chord_to_replay = (
+                    active_chord or playing_chord
+                )
+
+
+                if chord_to_replay is not None:
 
                     play_chord(
-                        active_chord,
+
+                        chord_to_replay,
+
                         chord_files
                     )
 
-                    print(
-                        "Replaying:",
-                        CHORDS[active_chord]["name"]
-                    )
+
+                    playing_chord = chord_to_replay
+
+                    last_valid_chord_time = time.monotonic()
+
 
     finally:
 
-        # Stop audio
+        # Stop any audio when the application closes.
+
         try:
 
-            winsound.PlaySound(
-                None,
-                winsound.SND_PURGE
-            )
+            stop_chord()
 
         except Exception:
 
             pass
 
-        # Release webcam
+
+        # Release the webcam.
+
         if camera is not None:
 
             camera.release()
 
-        # Close detector
+
+        # Close MediaPipe.
+
         if detector is not None:
 
             detector.close()
 
-        # Close windows
+
+        # Close all OpenCV windows.
+
         cv2.destroyAllWindows()
 
-        print("\nAI Virtual Guitar closed successfully.")
+
+        print("AI Virtual Guitar closed.")
 
 
 # ============================================================
-# 20. PROGRAM ENTRY POINT
+# 21. APPLICATION ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
 
     try:
 
-        main()
+        run_application()
+
 
     except KeyboardInterrupt:
 
-        print("\nProgram interrupted by user.")
+        print("\nApplication interrupted.")
+
 
     except Exception as error:
 
-        print("\nAPPLICATION ERROR:")
-
         print(
-            type(error).__name__,
-            ":",
-            error
+            f"\nAPPLICATION ERROR: "
+            f"{type(error).__name__}: {error}"
         )
