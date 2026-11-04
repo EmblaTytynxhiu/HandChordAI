@@ -1,32 +1,69 @@
 
-"""Gesture-controlled virtual guitar application.
+"""Gesture-controlled virtual guitar with personal hand calibration.
 
-The program combines MediaPipe hand landmarks, geometric finger-state
-recognition, temporal smoothing, chord lookup, generated WAV files, and an
-OpenCV user interface.  The left-most detected hand supplies the root note;
-the other hand supplies the chord quality.  A chord is played only after the
-gesture has remained stable long enough to pass the voting thresholds.
+The application combines:
+1. MediaPipe hand detection and 21 hand landmarks.
+2. Geometric finger-feature extraction.
+3. Personalized calibration for both hands.
+4. Temporal smoothing and gesture recognition.
+5. Generated WAV audio for 21 guitar chords.
+6. An OpenCV interface with live finger tracing and chord diagrams.
 
-The file is intentionally organized as a single executable module:
+CONTROLS
+--------
+C       Start/restart personal calibration.
+D       Toggle finger diagnostics.
+R       Reset the selected chord and gesture history.
+SPACE   Replay the selected chord.
+Q/ESC   Quit.
 
-1. Configuration and visual constants define the application's fixed inputs.
-2. Chord tables describe musical notes and guitar fingerings.
-3. MediaPipe helpers acquire and interpret hand landmarks.
-4. Drawing and audio helpers render feedback and play generated sounds.
-5. ``run_application`` owns camera setup, the frame loop, and cleanup.
+HAND ROLES
+----------
+Screen-left hand  = root note.
+Screen-right hand = chord quality.
+
+ROOT HAND
+---------
+Thumb closed + 0 fingers = C
+Thumb closed + 1 finger  = D
+Thumb closed + 2 fingers = E
+Thumb closed + 3 fingers = F
+Thumb closed + 4 fingers = G
+Thumb open   + 0 fingers = A
+Thumb open   + 1 finger  = B
+
+QUALITY HAND
+------------
+1 finger = Major
+2 fingers = Minor
+3 fingers = 7th
+
+Calibration is saved in finger_calibration.json. It adapts the geometric
+classifier to the user's measurements; it does not retrain MediaPipe itself.
 """
 
 from __future__ import annotations
 
+import json
 import time
 import urllib.request
 import wave
+
 from collections import Counter, deque
 from pathlib import Path
 
 import cv2
 import mediapipe as mp
 import numpy as np
+
+
+# ============================================================
+# 1. IMPORT WINDOWS AUDIO
+# ============================================================
+
+# winsound is included with Windows Python.
+# Keep the import optional so the rest of the program can still load
+# on systems where winsound is unavailable.
 
 try:
     import winsound
@@ -35,61 +72,66 @@ except ImportError:
 
 
 # ============================================================
-# 1. SETTINGS
+# 2. CONFIGURATION
 # ============================================================
 
-# Camera and output dimensions are kept separate because the source camera
-# stream is displayed inside only the left portion of the larger UI canvas.
+# Camera settings.
 CAMERA_INDEX = 0
 CAMERA_WIDTH = 960
 CAMERA_HEIGHT = 720
 
+# Application window dimensions.
 DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 720
 CAMERA_VIEW_WIDTH = 640
 
+# Audio settings.
 SAMPLE_RATE = 44100
 LOOP_DURATION = 2.0
 
-# MediaPipe is asked for exactly the two hands that have distinct roles in the
-# interaction: root-note hand first, chord-quality hand second.
+# Maximum number of hands MediaPipe should track.
 MAX_HANDS = 2
 
-# The history constants control two different kinds of stability.  Finger
-# histories smooth individual detections; gesture histories smooth the complete
-# chord input.  REQUIRED_VOTES is shared by complete-gesture voting.
-HISTORY_SIZE = 7
+# Gesture history settings.
+GESTURE_HISTORY_SIZE = 7
 FINGER_HISTORY_SIZE = 5
-REQUIRED_VOTES = 4
+REQUIRED_GESTURE_VOTES = 4
 
-# These grace periods prevent short camera dropouts or finger releases from
-# immediately clearing the current UI state or stopping the sound.
-RELEASE_GRACE_SECONDS = 0.5
-HAND_LOST_GRACE_SECONDS = 0.7
+# Audio and hand-detection grace periods.
+RELEASE_GRACE_SECONDS = 0.50
+HAND_LOST_GRACE_SECONDS = 0.70
 
-# All generated assets live beside this script so the program can be launched
-# from any working directory without relying on the process's current folder.
+# Calibration settings.
+CALIBRATION_SETTLE_SECONDS = 0.50
+CALIBRATION_CAPTURE_SECONDS = 2.50
+CALIBRATION_MIN_SAMPLES = 12
+
+# Store generated files beside this Python script.
 BASE_DIR = Path(__file__).resolve().parent
+
 SOUND_DIR = BASE_DIR / "sounds"
 MODEL_PATH = BASE_DIR / "hand_landmarker.task"
+CALIBRATION_PATH = BASE_DIR / "finger_calibration.json"
 
+# Official MediaPipe hand-landmarker model.
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
     "hand_landmarker/hand_landmarker/float16/1/"
     "hand_landmarker.task"
 )
 
+# Minimum MediaPipe detection confidence.
 DETECTION_CONFIDENCE = 0.55
 PRESENCE_CONFIDENCE = 0.55
 TRACKING_CONFIDENCE = 0.55
 
 
 # ============================================================
-# 2. COLORS
+# 3. COLORS
 # ============================================================
 
-# OpenCV uses BGR tuples rather than RGB tuples.  Keeping the palette in one
-# place makes the visual meaning of UI states consistent across all panels.
+# OpenCV uses BGR colors instead of RGB.
+
 BACKGROUND = (17, 22, 32)
 PANEL = (25, 33, 47)
 CARD = (34, 44, 60)
@@ -104,20 +146,43 @@ GOLD = (65, 195, 255)
 
 SUCCESS = (90, 220, 135)
 DANGER = (75, 90, 235)
+WARNING = (0, 190, 255)
+
 BORDER = (63, 76, 96)
 
+# Colors used to identify individual fingers.
+FINGER_COLORS = {
+    "THUMB": (255, 180, 70),
+    "INDEX": SUCCESS,
+    "MIDDLE": BLUE,
+    "RING": (220, 130, 240),
+    "PINKY": (255, 110, 110),
+}
+
+# Colors used for numbered guitar fingering dots.
+FINGER_NUMBER_COLORS = {
+    1: SUCCESS,
+    2: BLUE,
+    3: GOLD,
+    4: (220, 130, 240),
+}
+
 
 # ============================================================
-# 3. CHORD DEFINITIONS
+# 4. MUSICAL DEFINITIONS
 # ============================================================
 
-# ROOTS and QUALITIES are the canonical iteration order used by chord creation
-# and by the chord-library grid in the UI.
+# Available root notes.
 ROOTS = ["C", "D", "E", "F", "G", "A", "B"]
+
+# Available chord qualities.
 QUALITIES = ["MAJOR", "MINOR", "7TH"]
 
-# A root gesture is represented as (thumb_open, non_thumb_finger_count).
-# The closed-thumb range provides C-G; opening the thumb extends it to A-B.
+# Root-hand gesture mapping.
+#
+# A tuple contains:
+# (thumb_is_open, number_of_open_non_thumb_fingers)
+
 ROOT_GESTURES = {
     (False, 0): "C",
     (False, 1): "D",
@@ -128,14 +193,14 @@ ROOT_GESTURES = {
     (True, 1): "B",
 }
 
+# Quality-hand gesture mapping.
 QUALITY_GESTURES = {
     1: "MAJOR",
     2: "MINOR",
     3: "7TH",
 }
 
-# Semitone offsets locate chord tones in NOTE_NAMES.  Frequencies below use
-# the corresponding root frequency and the equal-temperament ratio.
+# Semitone positions of natural notes relative to C.
 ROOT_SEMITONES = {
     "C": 0,
     "D": 2,
@@ -146,6 +211,8 @@ ROOT_SEMITONES = {
     "B": 11,
 }
 
+# Fundamental frequencies of the root notes.
+# All notes are kept in a similar lower register.
 ROOT_FREQUENCIES = {
     "C": 130.81,
     "D": 146.83,
@@ -156,50 +223,71 @@ ROOT_FREQUENCIES = {
     "B": 246.94,
 }
 
+# Chromatic note names.
 NOTE_NAMES = [
     "C", "C#", "D", "D#", "E", "F",
     "F#", "G", "G#", "A", "A#", "B"
 ]
 
+# Chord intervals measured in semitones.
 CHORD_INTERVALS = {
     "MAJOR": (0, 4, 7),
     "MINOR": (0, 3, 7),
     "7TH": (0, 4, 7, 10),
 }
 
-# A fret string lists the six guitar strings from low E to high e.  ``x`` is
-# muted and ``0`` is open; other digits identify the fret number.
+
+# ============================================================
+# 5. GUITAR FRET SHAPES
+# ============================================================
+
+# Every shape contains six characters.
+#
+# The order is:
+# Low E, A, D, G, B, high e.
+#
+# X = muted string.
+# 0 = open string.
+# Other digits = fret number.
+
 FRET_SHAPES = {
+
     "C": {
         "MAJOR": "x32010",
         "MINOR": "x35543",
         "7TH": "x32310",
     },
+
     "D": {
         "MAJOR": "xx0232",
         "MINOR": "xx0231",
         "7TH": "xx0212",
     },
+
     "E": {
         "MAJOR": "022100",
         "MINOR": "022000",
         "7TH": "020100",
     },
+
     "F": {
         "MAJOR": "133211",
         "MINOR": "133111",
         "7TH": "131211",
     },
+
     "G": {
         "MAJOR": "320003",
         "MINOR": "355333",
         "7TH": "320001",
     },
+
     "A": {
         "MAJOR": "x02220",
         "MINOR": "x02210",
         "7TH": "x02020",
     },
+
     "B": {
         "MAJOR": "x24442",
         "MINOR": "x24432",
@@ -209,18 +297,19 @@ FRET_SHAPES = {
 
 
 # ============================================================
-# 4. GUITAR FINGERINGS
+# 6. GUITAR FINGER ASSIGNMENTS
 # ============================================================
 
-# String order:
-# Low E, A, D, G, B, high e.
+# Guitar finger numbers:
 #
-# 0 = open string
 # 1 = index finger
 # 2 = middle finger
 # 3 = ring finger
 # 4 = pinky
+# 0 = open string
 # None = muted string
+#
+# The entries use the same low-E-to-high-e string order.
 
 CHORD_FINGERINGS = {
 
@@ -253,99 +342,22 @@ CHORD_FINGERINGS = {
     "B7":     (None, 2, 1, 3, 0, 4),
 }
 
+# Guitar strings from thickest to thinnest.
 STRING_NAMES = ["E", "A", "D", "G", "B", "e"]
 
-# Finger colors match the numbered finger legend in the right-hand panel.
-FINGER_COLORS = {
-    1: SUCCESS,
-    2: BLUE,
-    3: GOLD,
-    4: (220, 130, 240),
-}
-
 
 # ============================================================
-# 5. BUILD ALL 21 CHORDS
+# 7. MEDIAPIPE LANDMARK DEFINITIONS
 # ============================================================
 
-def build_chords():
-    """Build the complete root/quality chord catalogue.
+# MediaPipe provides 21 hand landmarks.
+#
+# Each non-thumb finger has:
+# MCP = base knuckle
+# PIP = middle joint
+# DIP = joint near the fingertip
+# TIP = fingertip
 
-    Each chord entry contains the musical notes, synthesized frequencies,
-    displayed fret shape, and per-string finger assignments.  The function
-    also validates that every generated chord has a matching guitar fingering,
-    so a missing data-table entry fails during startup instead of later in
-    the camera loop.
-    """
-
-    chords = {}
-
-    for root in ROOTS:
-
-        for quality in QUALITIES:
-
-            root_note = ROOT_SEMITONES[root]
-            root_frequency = ROOT_FREQUENCIES[root]
-
-            notes = []
-            frequencies = []
-
-            for interval in CHORD_INTERVALS[quality]:
-
-                note_index = (
-                    root_note + interval
-                ) % 12
-
-                notes.append(
-                    NOTE_NAMES[note_index]
-                )
-
-                frequencies.append(
-                    root_frequency * (2 ** (interval / 12))
-                )
-
-            chord_name = root + quality
-
-            # IMPORTANT FIX:
-            # Seventh chord names are C7TH, D7TH, etc.
-            # The fingering dictionary uses C7, D7, etc.
-            #
-            # Convert the key before accessing the dictionary.
-
-            if quality == "7TH":
-                finger_key = root + "7"
-            else:
-                finger_key = root + quality
-
-            # Verify that a fingering exists.
-            if finger_key not in CHORD_FINGERINGS:
-                raise KeyError(
-                    f"Missing guitar fingering: {finger_key}"
-                )
-
-            chords[chord_name] = {
-                "root": root,
-                "quality": quality,
-                "notes": notes,
-                "frequencies": frequencies,
-                "fret": FRET_SHAPES[root][quality],
-                "fingers": CHORD_FINGERINGS[finger_key],
-            }
-
-    return chords
-
-
-CHORDS = build_chords()
-
-assert len(CHORDS) == 21, "There should be exactly 21 chords."
-
-
-# ============================================================
-# 6. HAND LANDMARKS
-# ============================================================
-
-# MediaPipe's 21-point hand model uses indices 0-20.  Each tuple identifies
-# the joints needed for one finger's geometry: MCP, PIP, DIP, and fingertip.
 FINGER_LANDMARKS = {
     "INDEX": (5, 6, 7, 8),
     "MIDDLE": (9, 10, 11, 12),
@@ -353,6 +365,7 @@ FINGER_LANDMARKS = {
     "PINKY": (17, 18, 19, 20),
 }
 
+# Landmark paths used to draw the fingers.
 TRACE_LANDMARKS = {
     "THUMB": (1, 2, 3, 4),
     "INDEX": (5, 6, 7, 8),
@@ -361,8 +374,7 @@ TRACE_LANDMARKS = {
     "PINKY": (17, 18, 19, 20),
 }
 
-# These pairs describe the bones drawn by the camera overlay.  They are kept
-# separate from FINGER_LANDMARKS because the palm also needs connecting edges.
+# Connections between landmarks used to draw the hand skeleton.
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -372,24 +384,112 @@ HAND_CONNECTIONS = [
     (0, 17),
 ]
 
+# Consistent finger and hand-role ordering.
+FINGER_NAMES = [
+    "THUMB", "INDEX", "MIDDLE", "RING", "PINKY"
+]
+
+ROLE_NAMES = ["ROOT", "QUALITY"]
+
 
 # ============================================================
-# 7. DOWNLOAD MEDIAPIPE MODEL
+# 8. BUILD THE 21 CHORDS
+# ============================================================
+
+def build_chords():
+    """Create all chord entries, including notes, frequencies, and fingerings.
+
+    Seventh chords use names such as C7TH internally. The fingering table uses
+    C7, so the key is translated before looking up the finger assignments.
+    """
+
+    chords = {}
+
+    # Process every root note and every chord quality.
+    for root in ROOTS:
+
+        for quality in QUALITIES:
+
+            notes = []
+            frequencies = []
+
+            # Calculate all notes belonging to this chord.
+            for interval in CHORD_INTERVALS[quality]:
+
+                note_index = (
+                    ROOT_SEMITONES[root] + interval
+                ) % 12
+
+                notes.append(
+                    NOTE_NAMES[note_index]
+                )
+
+                frequencies.append(
+                    ROOT_FREQUENCIES[root]
+                    * (2 ** (interval / 12))
+                )
+
+            # Internal chord name.
+            chord_name = root + quality
+
+            # Convert C7TH to C7, D7TH to D7, and so on.
+            finger_key = (
+                root + "7"
+                if quality == "7TH"
+                else root + quality
+            )
+
+            # Validate that the chord has a fingering entry.
+            if finger_key not in CHORD_FINGERINGS:
+                raise KeyError(
+                    f"Missing guitar fingering: {finger_key}"
+                )
+
+            # Retrieve the fret shape and finger assignments.
+            fret_shape = FRET_SHAPES[root][quality]
+            fingering = CHORD_FINGERINGS[finger_key]
+
+            # Each guitar chord must contain exactly six strings.
+            if len(fret_shape) != 6 or len(fingering) != 6:
+                raise ValueError(
+                    f"Invalid guitar shape for {chord_name}"
+                )
+
+            # Store everything needed by the audio and UI.
+            chords[chord_name] = {
+                "root": root,
+                "quality": quality,
+                "notes": notes,
+                "frequencies": frequencies,
+                "fret": fret_shape,
+                "fingers": fingering,
+            }
+
+    # There must be seven roots multiplied by three qualities.
+    if len(chords) != 21:
+        raise ValueError(
+            f"Expected 21 chords, but created {len(chords)}"
+        )
+
+    return chords
+
+
+# Create the chord dictionary once.
+CHORDS = build_chords()
+
+
+# ============================================================
+# 9. DOWNLOAD THE MEDIAPIPE MODEL
 # ============================================================
 
 def download_model():
-    """Download the MediaPipe hand model when it is absent or incomplete.
+    """Download the MediaPipe model if it is not already available."""
 
-    The size check prevents a truncated or empty file from being treated as a
-    valid model.  Download failures are re-raised as ``RuntimeError`` with
-    context for the user.
-    """
-
-    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 100000:
-        print("Hand detection model already exists.")
+    # Reuse the existing model if it appears to be a valid file.
+    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 100_000:
         return
 
-    print("Downloading hand detection model...")
+    print("Downloading MediaPipe hand model...")
 
     try:
 
@@ -398,50 +498,40 @@ def download_model():
             str(MODEL_PATH)
         )
 
-        if MODEL_PATH.stat().st_size < 100000:
-            raise RuntimeError("Downloaded model is incomplete.")
-
-        print("Model downloaded successfully.")
+        # Reject an empty or incomplete download.
+        if MODEL_PATH.stat().st_size <= 100_000:
+            raise RuntimeError(
+                "Downloaded model file is too small."
+            )
 
     except Exception as error:
 
         raise RuntimeError(
-            f"Could not download MediaPipe model: {error}"
-        )
+            f"Could not download the hand model: {error}"
+        ) from error
 
 
 # ============================================================
-# 8. CREATE HAND DETECTOR
+# 10. CREATE THE HAND DETECTOR
 # ============================================================
 
 def create_hand_detector():
-    """Create and configure the MediaPipe video-mode hand detector.
+    """Create a MediaPipe hand detector configured for video input."""
 
-    The detector is configured for the application's maximum hand count and
-    confidence thresholds, then returned to the main loop for frame-by-frame
-    inference.
-    """
-
-    # Make sure the model file exists before MediaPipe tries to open it.
+    # Make sure the neural-network model has been downloaded.
     download_model()
 
-    # HandLandmarkerOptions is the configuration object consumed by MediaPipe.
+    # VIDEO mode supports tracking between consecutive frames.
     options = mp.tasks.vision.HandLandmarkerOptions(
 
-        # Tell MediaPipe where the downloaded neural-network asset is stored.
         base_options=mp.tasks.BaseOptions(
             model_asset_path=str(MODEL_PATH)
         ),
 
-        # VIDEO mode allows MediaPipe to use timestamps and track hands between
-        # frames instead of treating every frame as an unrelated image.
         running_mode=mp.tasks.vision.RunningMode.VIDEO,
 
-        # The application assigns roles to at most two detected hands.
         num_hands=MAX_HANDS,
 
-        # These thresholds trade recall for stability: detections below them
-        # are ignored as too uncertain.
         min_hand_detection_confidence=DETECTION_CONFIDENCE,
 
         min_hand_presence_confidence=PRESENCE_CONFIDENCE,
@@ -449,112 +539,94 @@ def create_hand_detector():
         min_tracking_confidence=TRACKING_CONFIDENCE,
     )
 
-    # Build and return the detector that will be reused for every frame.
+    # Return the configured detector.
     return mp.tasks.vision.HandLandmarker.create_from_options(
         options
     )
 
 
 # ============================================================
-# 9. ANGLE AND SCORE FUNCTIONS
+# 11. CALCULATE JOINT ANGLES
 # ============================================================
 
 def calculate_angle(a, b, c):
-    """Return the angle at point ``b`` formed by points ``a`` and ``c``.
+    """Calculate the 3D angle at point b."""
 
-    Landmark coordinates are treated as three-dimensional vectors.  Degenerate
-    vectors return zero, and the cosine is clipped before ``arccos`` to avoid
-    floating-point drift outside the valid mathematical range.
-    """
-
-    # Both vectors start at the vertex point b and point toward the other
-    # two points.  Their angle is the joint bend we want to measure.
+    # Create vectors from the joint to its neighboring landmarks.
     vector1 = a - b
     vector2 = c - b
 
-    # The vector lengths are needed to normalize the dot product.
+    # Calculate vector lengths.
     norm1 = np.linalg.norm(vector1)
     norm2 = np.linalg.norm(vector2)
 
-    # A zero-length vector has no meaningful direction, so avoid division by
-    # zero and return the safest neutral value.
+    # Avoid division by zero.
     if norm1 < 1e-8 or norm2 < 1e-8:
         return 0.0
 
-    # The dot-product formula gives cos(theta) for the angle between vectors.
+    # Normalize the dot product to obtain the angle.
     cosine = np.dot(vector1, vector2) / (norm1 * norm2)
 
-    # Floating-point rounding can produce values slightly outside [-1, 1].
+    # Protect arccos from small floating-point errors.
     cosine = np.clip(cosine, -1.0, 1.0)
 
-    # Convert the inverse cosine from radians to degrees for readable thresholds.
+    # Return the angle in degrees.
     return float(
         np.degrees(np.arccos(cosine))
     )
 
 
-def clamp_score(value):
-    """Clamp a recognition score to the inclusive interval ``[0.0, 1.0]``."""
-
-    # Recognition components are combined as weighted scores, so every
-    # component must stay in the same normalized range.
-    return float(
-        np.clip(value, 0.0, 1.0)
-    )
-
-
 # ============================================================
-# 10. STRICT FINGER RECOGNITION
+# 12. EXTRACT FINGER FEATURES
 # ============================================================
 
-def recognize_fingers(world_landmarks, previous_states=None):
-    """Classify each finger as open or closed from world-space landmarks.
+def extract_features(world_landmarks):
+    """Extract measurements describing the position of each finger.
 
-    Non-thumb fingers use joint angles, extension ratios, and reach ratios.
-    The previous state provides hysteresis: an already-open finger uses lower
-    thresholds, reducing flicker when a gesture is held near a boundary.
+    Non-thumb feature vector:
+        PIP angle, DIP angle, extension ratio, wrist reach.
 
-    Returns:
-        A tuple containing the number of open non-thumb fingers, a mapping of
-        finger names to boolean states, and numeric diagnostics for the UI.
+    Thumb feature vector:
+        Thumb angle, distance from index base, distance from wrist.
+
+    The same feature extraction is used during calibration and normal tracking.
     """
 
-    # The first frame has no previous state, so all fingers begin as closed.
-    if previous_states is None:
-        previous_states = {}
-
-    # Convert MediaPipe landmark objects into a numeric array.  This makes
-    # vector subtraction and distance calculations concise and fast.
-    points = np.array(
+    # Convert MediaPipe landmark objects into a NumPy array.
+    points = np.asarray(
         [
-            [p.x, p.y, p.z]
-            for p in world_landmarks
+            [point.x, point.y, point.z]
+            for point in world_landmarks
         ],
         dtype=np.float64
     )
 
-    # states is the boolean result used by the application.
-    states = {}
-    # diagnostics retains the measurements shown by the optional debug panel.
-    diagnostics = {}
+    # Palm width is used to normalize distances.
+    palm_width = max(
+        float(np.linalg.norm(points[5] - points[17])),
+        1e-6
+    )
 
-    # Landmark 0 is the wrist, used as a stable reference for reach.
+    # Landmark 0 represents the wrist.
     wrist = points[0]
+
+    features = {}
 
     # --------------------------------------------------------
     # INDEX, MIDDLE, RING AND PINKY
     # --------------------------------------------------------
 
-    # Evaluate each non-thumb finger using the same geometric recipe.
     for name, indices in FINGER_LANDMARKS.items():
 
-        # Unpack the four joints needed to measure this finger.
-        mcp, pip, dip, tip = (
-            points[index]
-            for index in indices
-        )
+        # Retrieve the four landmarks for this finger.
+        mcp_i, pip_i, dip_i, tip_i = indices
 
-        # A straight finger has large angles at both bendable joints.
+        mcp = points[mcp_i]
+        pip = points[pip_i]
+        dip = points[dip_i]
+        tip = points[tip_i]
+
+        # Measure the PIP and DIP joint angles.
         pip_angle = calculate_angle(
             mcp, pip, dip
         )
@@ -563,292 +635,756 @@ def recognize_fingers(world_landmarks, previous_states=None):
             pip, dip, tip
         )
 
-        # Compare the direct MCP-to-tip distance with the first segment length.
-        mcp_to_pip = np.linalg.norm(
-            pip - mcp
+        # Measure the first finger segment.
+        first_segment = max(
+            float(np.linalg.norm(pip - mcp)),
+            1e-6
         )
 
-        mcp_to_tip = np.linalg.norm(
-            tip - mcp
-        )
-
-        # Open fingers tend to reach farther from their MCP than folded ones.
+        # Compare fingertip distance with the first segment.
         extension_ratio = (
-            mcp_to_tip / max(mcp_to_pip, 1e-6)
+            float(np.linalg.norm(tip - mcp))
+            / first_segment
         )
 
-        # Reach is measured relative to the wrist so it is less dependent on
-        # the absolute size or distance of the hand from the camera.
-        mcp_to_wrist = np.linalg.norm(
-            mcp - wrist
+        # Measure the fingertip's distance from the wrist.
+        wrist_reach = (
+            float(np.linalg.norm(tip - wrist))
+            / palm_width
         )
 
-        tip_to_wrist = np.linalg.norm(
-            tip - wrist
+        # Store all four measurements.
+        features[name] = np.array(
+            [
+                pip_angle,
+                dip_angle,
+                extension_ratio,
+                wrist_reach
+            ],
+            dtype=np.float64
         )
-
-        reach_ratio = (
-            tip_to_wrist / max(mcp_to_wrist, 1e-6)
-        )
-
-        # Convert each raw measurement into a 0-1 contribution.  The constants
-        # are empirically chosen boundaries for this application's gestures.
-        pip_score = clamp_score(
-            (pip_angle - 115) / 60
-        )
-
-        dip_score = clamp_score(
-            (dip_angle - 105) / 70
-        )
-
-        extension_score = clamp_score(
-            (extension_ratio - 1.0) / 0.85
-        )
-
-        reach_score = clamp_score(
-            (reach_ratio - 1.0) / 0.50
-        )
-
-        # Combine the four signals.  Joint angles are the strongest evidence,
-        # while extension and reach provide supporting evidence.
-        score = (
-            0.36 * pip_score
-            + 0.24 * dip_score
-            + 0.25 * extension_score
-            + 0.15 * reach_score
-        )
-
-        # Hysteresis uses different thresholds when leaving versus entering
-        # the open state.  This prevents small landmark jitter from toggling a
-        # finger repeatedly at one exact boundary.
-        was_open = previous_states.get(
-            name,
-            False
-        )
-
-        if was_open:
-
-            score_threshold = 0.58
-            pip_minimum = 132
-            extension_minimum = 1.18
-
-        else:
-
-            score_threshold = 0.68
-            pip_minimum = 142
-            extension_minimum = 1.30
-
-        # A finger must pass all three hard checks, not just the weighted score.
-        is_open = (
-            score >= score_threshold
-            and pip_angle >= pip_minimum
-            and extension_ratio >= extension_minimum
-        )
-
-        # Store a real bool because NumPy boolean values can be awkward in UI
-        # formatting and later dictionary comparisons.
-        states[name] = bool(is_open)
-
-        # Keep raw values available for threshold tuning and on-screen debug.
-        diagnostics[name] = {
-            "pip": float(pip_angle),
-            "dip": float(dip_angle),
-            "ratio": float(extension_ratio),
-            "reach": float(reach_ratio),
-            "score": float(score),
-            "open": bool(is_open),
-        }
 
     # --------------------------------------------------------
-    # THUMB RECOGNITION
+    # THUMB
     # --------------------------------------------------------
 
-    # The thumb uses a separate geometry because it does not have the same
-    # MCP/PIP/DIP layout as the four fingers above.
+    # Measure the thumb joint angle.
     thumb_angle = calculate_angle(
         points[2],
         points[3],
         points[4]
     )
 
-    # Palm width provides a scale reference for thumb reach.
-    palm_width = np.linalg.norm(
-        points[5] - points[17]
+    # Measure distance from the thumb tip to the index base.
+    thumb_from_index = (
+        float(np.linalg.norm(points[4] - points[5]))
+        / palm_width
     )
 
-    # Measure how far the thumb tip is from the index MCP.
-    thumb_distance = np.linalg.norm(
-        points[4] - points[5]
+    # Measure thumb distance from the wrist.
+    thumb_from_wrist = (
+        float(np.linalg.norm(points[4] - wrist))
+        / palm_width
     )
 
-    # Normalize thumb reach by palm size so the threshold is scale-independent.
-    thumb_ratio = (
-        thumb_distance / max(palm_width, 1e-6)
+    # Save the thumb measurements.
+    features["THUMB"] = np.array(
+        [
+            thumb_angle,
+            thumb_from_index,
+            thumb_from_wrist
+        ],
+        dtype=np.float64
     )
 
-    # Apply thumb hysteresis just as for the other fingers.
-    was_thumb_open = previous_states.get(
-        "THUMB",
-        False
-    )
+    return features
 
-    if was_thumb_open:
 
-        angle_threshold = 138
-        distance_threshold = 0.56
+# ============================================================
+# 13. GENERIC FINGER CLASSIFICATION
+# ============================================================
+
+def fallback_classification(
+    feature_vector,
+    finger_name,
+    previous_state
+):
+    """Classify a finger using default geometric rules.
+
+    These thresholds are a fallback for users who have not calibrated.
+    Personalized calibration is recommended for better recognition.
+    """
+
+    # The thumb uses a separate feature vector.
+    if finger_name == "THUMB":
+
+        angle, thumb_ratio, wrist_ratio = feature_vector
+
+        # Use lower thresholds when the thumb was already open.
+        if previous_state:
+
+            is_open = (
+                angle >= 135
+                and thumb_ratio >= 0.55
+            )
+
+        else:
+
+            is_open = (
+                angle >= 148
+                and thumb_ratio >= 0.68
+            )
+
+        # This is a rough geometric confidence value.
+        confidence = min(
+            1.0,
+            max(0.0, (thumb_ratio - 0.35) / 0.70)
+        )
+
+        return bool(is_open), confidence
+
+    # Extract the four measurements for a normal finger.
+    (
+        pip_angle,
+        dip_angle,
+        extension_ratio,
+        wrist_reach
+    ) = feature_vector
+
+    # Lower thresholds prevent an already open finger from flickering closed.
+    if previous_state:
+
+        is_open = (
+            pip_angle >= 140
+            and dip_angle >= 125
+            and extension_ratio >= 1.22
+        )
 
     else:
 
-        angle_threshold = 150
-        distance_threshold = 0.66
+        is_open = (
+            pip_angle >= 150
+            and dip_angle >= 138
+            and extension_ratio >= 1.35
+        )
 
-    # Both the thumb bend and its distance from the palm must indicate open.
-    thumb_open = (
-        thumb_angle >= angle_threshold
-        and thumb_ratio >= distance_threshold
+    # Calculate a rough confidence from angle and extension.
+    angle_part = np.clip(
+        (pip_angle - 110) / 70,
+        0.0,
+        1.0
     )
 
-    # Store thumb state separately; it affects the root-note mapping but is not
-    # included in the non-thumb root finger count.
-    states["THUMB"] = bool(thumb_open)
-
-    diagnostics["THUMB"] = {
-        "pip": float(thumb_angle),
-        "dip": 0.0,
-        "ratio": float(thumb_ratio),
-        "reach": 0.0,
-        "score": 1.0 if thumb_open else 0.0,
-        "open": bool(thumb_open),
-    }
-
-    # Count only index through pinky because root gestures reserve the thumb as
-    # a separate binary switch between the C-G and A-B ranges.
-    finger_count = sum(
-        states[name]
-        for name in FINGER_LANDMARKS
+    extension_part = np.clip(
+        (extension_ratio - 0.9) / 0.8,
+        0.0,
+        1.0
     )
 
-    return finger_count, states, diagnostics
+    confidence = float(
+        (angle_part + extension_part) / 2.0
+    )
+
+    return bool(is_open), confidence
 
 
 # ============================================================
-# 11. TEMPORAL FINGER SMOOTHING
+# 14. CALIBRATED FINGER CLASSIFICATION
 # ============================================================
 
-def create_finger_histories():
-    """Create one short boolean history queue for each recognized finger."""
+def classify_with_calibration(
+    feature_vector,
+    finger_name,
+    profile,
+    previous_state
+):
+    """Compare a live finger measurement with its calibrated poses.
 
-    # A deque automatically discards the oldest sample when it reaches the
-    # configured maximum length, keeping memory and response time bounded.
-    return {
-        name: deque(maxlen=FINGER_HISTORY_SIZE)
-        for name in [
-            "THUMB",
-            "INDEX",
-            "MIDDLE",
-            "RING",
-            "PINKY",
-        ]
-    }
+    Calibration provides two feature centers:
+    - one for a closed finger;
+    - one for an extended finger.
 
-
-def stabilize_fingers(raw_states, histories):
-    """Use majority voting over recent frames to stabilize finger states.
-
-    Ties intentionally fall back to the current raw value, allowing a state
-    change to begin immediately instead of preserving an arbitrary older
-    value.
+    The current measurement is compared with both centers. A small uncertain
+    region preserves the previous state instead of rapidly changing the finger.
     """
 
-    # Build a new result rather than altering the raw recognition dictionary.
-    stable_states = {}
+    # Retrieve this finger's calibration entry.
+    entry = profile[finger_name]
 
-    # Smooth each finger independently so one uncertain finger does not affect
-    # the state of the other four.
-    for name, raw_value in raw_states.items():
+    closed_center = np.asarray(
+        entry["closed"],
+        dtype=np.float64
+    )
 
-        # Normalize the incoming value to bool before storing it.
-        histories[name].append(
-            bool(raw_value)
+    open_center = np.asarray(
+        entry["open"],
+        dtype=np.float64
+    )
+
+    # Scale prevents one feature with large numerical values from dominating.
+    scale = np.maximum(
+        np.asarray(entry["scale"], dtype=np.float64),
+        1e-6
+    )
+
+    # Calculate normalized squared distance from the closed calibration center.
+    distance_closed = float(
+        np.mean(
+            ((feature_vector - closed_center) / scale) ** 2
+        )
+    )
+
+    # Calculate normalized squared distance from the open calibration center.
+    distance_open = float(
+        np.mean(
+            ((feature_vector - open_center) / scale) ** 2
+        )
+    )
+
+    # A measurement close to open has a small open distance and a larger
+    # closed distance. This produces a score close to 1.
+    denominator = max(
+        distance_closed + distance_open,
+        1e-8
+    )
+
+    open_score = (
+        distance_closed / denominator
+    )
+
+    # Convert the distance from the ambiguous midpoint into a confidence score.
+    confidence = float(
+        min(
+            1.0,
+            abs(open_score - 0.5) * 2.0
+        )
+    )
+
+    # Decide whether the finger is open or closed.
+    if open_score >= 0.60:
+
+        state = True
+
+    elif open_score <= 0.40:
+
+        state = False
+
+    else:
+
+        # Keep the previous state if the feature is ambiguous.
+        state = bool(previous_state)
+
+    return bool(state), confidence
+
+
+# ============================================================
+# 15. RECOGNIZE ALL FIVE FINGERS
+# ============================================================
+
+def recognize_fingers(
+    world_landmarks,
+    previous_states=None,
+    calibration=None
+):
+    """Recognize each finger and return its count, states, and diagnostics.
+
+    The calibration argument must be the profile for one hand role:
+    ROOT or QUALITY. The two hands have separate profiles.
+    """
+
+    # If this is the first frame, assume all fingers are folded.
+    if previous_states is None:
+        previous_states = {}
+
+    # Extract measurements from all hand landmarks.
+    features = extract_features(world_landmarks)
+
+    states = {}
+    diagnostics = {}
+
+    # Classify every finger independently.
+    for finger_name in FINGER_NAMES:
+
+        previous_state = bool(
+            previous_states.get(finger_name, False)
         )
 
-        # True behaves like 1 in Python, so summing gives the number of open
-        # observations in the recent window.
-        open_votes = sum(
-            histories[name]
-        )
+        # Use personalized recognition when a profile is available.
+        if calibration is not None:
 
-        # Every remaining observation is a closed vote.
-        closed_votes = (
-            len(histories[name]) - open_votes
-        )
+            state, confidence = classify_with_calibration(
+                features[finger_name],
+                finger_name,
+                calibration,
+                previous_state
+            )
 
-        # A strict majority produces the stable result.
-        if open_votes > closed_votes:
-
-            stable_states[name] = True
-
-        # The opposite majority produces a stable closed result.
-        elif closed_votes > open_votes:
-
-            stable_states[name] = False
-
+        # Otherwise use generic fallback thresholds.
         else:
-            # A tie is possible during startup or a transition.  Preserve the
-            # latest observation so the interface remains responsive.
-            stable_states[name] = bool(raw_value)
 
-    return stable_states
+            state, confidence = fallback_classification(
+                features[finger_name],
+                finger_name,
+                previous_state
+            )
+
+        states[finger_name] = bool(state)
+
+        vector = features[finger_name]
+
+        # Keep measurements for the diagnostics panel.
+        diagnostics[finger_name] = {
+            "pip": float(vector[0]),
+
+            "dip": (
+                float(vector[1])
+                if finger_name != "THUMB"
+                else 0.0
+            ),
+
+            "ratio": (
+                float(vector[2])
+                if finger_name != "THUMB"
+                else float(vector[1])
+            ),
+
+            "score": float(confidence),
+            "confidence": float(confidence),
+            "open": bool(state),
+        }
+
+    # The thumb is NOT included in the four-finger count.
+    count = sum(
+        1
+        for name in FINGER_LANDMARKS
+        if states[name]
+    )
+
+    return count, states, diagnostics
 
 
 # ============================================================
-# 12. DETECT HANDS
+# 16. CALIBRATION SESSION
 # ============================================================
 
-def detect_hands(detector, frame, timestamp):
-    """Run MediaPipe on one BGR frame and return hands sorted left-to-right.
+def create_calibration_session():
+    """Create the state dictionary for the two-pose calibration wizard."""
 
-    MediaPipe expects RGB input, while OpenCV captures BGR input.  Each result
-    keeps its image-space landmarks for drawing and world-space landmarks for
-    geometric recognition.  Sorting by the average image-space x coordinate
-    makes hand roles deterministic for the rest of the application.
+    return {
+        "active": False,
+        "phase": 0,
+        "phase_start": 0.0,
+        "samples": [],
+        "closed_samples": [],
+        "open_samples": [],
+        "notice": "",
+    }
+
+
+def start_calibration(session, now):
+    """Start a new calibration and clear previous temporary samples."""
+
+    session.update({
+        "active": True,
+        "phase": 0,
+        "phase_start": now,
+        "samples": [],
+        "closed_samples": [],
+        "open_samples": [],
+        "notice": "",
+    })
+
+    print(
+        "Calibration started: hold BOTH hands in relaxed fists."
+    )
+
+
+def cancel_calibration(session):
+    """Cancel the current calibration without deleting the saved profile."""
+
+    session["active"] = False
+    session["samples"] = []
+    session["notice"] = "Calibration cancelled."
+
+
+def collect_calibration_sample(hands):
+    """Collect features from the left and right hands separately.
+
+    The left-most hand is the ROOT role and the right-most is the QUALITY role.
+    The profiles are deliberately not averaged together.
     """
 
-    # OpenCV captures BGR pixels; MediaPipe expects RGB pixels.
+    return {
+        "ROOT": extract_features(hands[0][2]),
+        "QUALITY": extract_features(hands[1][2]),
+    }
+
+
+# ============================================================
+# 17. BUILD A PERSONAL CALIBRATION PROFILE
+# ============================================================
+
+def make_calibration_profile(
+    closed_samples,
+    open_samples
+):
+    """Calculate median closed/open feature centers and robust feature scales.
+
+    Median measurements reduce the influence of occasional bad landmark frames.
+    A minimum scale prevents tiny variations from making the classifier unstable.
+    """
+
+    profile = {}
+
+    # Minimum variation allowed for each measurement.
+    scale_floors = {
+
+        "THUMB": np.array([
+            8.0, 0.08, 0.08
+        ]),
+
+        "INDEX": np.array([
+            8.0, 8.0, 0.08, 0.08
+        ]),
+
+        "MIDDLE": np.array([
+            8.0, 8.0, 0.08, 0.08
+        ]),
+
+        "RING": np.array([
+            8.0, 8.0, 0.08, 0.08
+        ]),
+
+        "PINKY": np.array([
+            8.0, 8.0, 0.08, 0.08
+        ]),
+    }
+
+    for finger in FINGER_NAMES:
+
+        # Convert all samples into numerical arrays.
+        closed_array = np.asarray(
+            [sample[finger] for sample in closed_samples],
+            dtype=np.float64
+        )
+
+        open_array = np.asarray(
+            [sample[finger] for sample in open_samples],
+            dtype=np.float64
+        )
+
+        # The median is used instead of the mean to reduce outlier influence.
+        closed_center = np.median(
+            closed_array,
+            axis=0
+        )
+
+        open_center = np.median(
+            open_array,
+            axis=0
+        )
+
+        # Combine both pose groups for spread estimation.
+        all_values = np.vstack(
+            (closed_array, open_array)
+        )
+
+        combined_median = np.median(
+            all_values,
+            axis=0
+        )
+
+        # Median absolute deviation provides a robust spread estimate.
+        mad = np.median(
+            np.abs(all_values - combined_median),
+            axis=0
+        )
+
+        robust_spread = 1.4826 * mad
+
+        # How far apart are the two pose centers?
+        class_separation = np.abs(
+            open_center - closed_center
+        )
+
+        # Scale each feature using noise, pose separation, and its minimum floor.
+        scale = np.maximum.reduce((
+            scale_floors[finger],
+            robust_spread * 2.0,
+            class_separation * 0.35,
+        ))
+
+        # Save all three values needed for later recognition.
+        profile[finger] = {
+            "closed": closed_center.tolist(),
+            "open": open_center.tolist(),
+            "scale": scale.tolist(),
+        }
+
+    return profile
+
+
+# ============================================================
+# 18. SAVE CALIBRATION
+# ============================================================
+
+def save_calibration(profile):
+    """Save the personal calibration profile as JSON."""
+
+    # Version the file so incompatible future formats can be detected.
+    document = {
+        "version": 2,
+        "roles": profile,
+    }
+
+    try:
+
+        CALIBRATION_PATH.write_text(
+            json.dumps(document, indent=2),
+            encoding="utf-8"
+        )
+
+        return True
+
+    except OSError as error:
+
+        print(
+            f"Could not save calibration: {error}"
+        )
+
+        return False
+
+
+# ============================================================
+# 19. LOAD CALIBRATION
+# ============================================================
+
+def load_calibration():
+    """Load and validate the saved root-hand and quality-hand profiles."""
+
+    if not CALIBRATION_PATH.exists():
+        return None
+
+    try:
+
+        document = json.loads(
+            CALIBRATION_PATH.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        # Only version 2 has the separate ROOT and QUALITY format.
+        if document.get("version") != 2:
+            raise ValueError(
+                "Unsupported calibration file version."
+            )
+
+        roles = document["roles"]
+
+        # Verify every role and finger exists.
+        for role in ROLE_NAMES:
+
+            role_profile = roles[role]
+
+            for finger in FINGER_NAMES:
+
+                entry = role_profile[finger]
+
+                expected_length = (
+                    3 if finger == "THUMB" else 4
+                )
+
+                # Every feature vector must have its expected length.
+                for key in ("closed", "open", "scale"):
+
+                    if len(entry[key]) != expected_length:
+
+                        raise ValueError(
+                            f"Invalid {role}/{finger}/{key} feature length."
+                        )
+
+        return roles
+
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError
+    ) as error:
+
+        print(
+            "Saved calibration could not be loaded:",
+            error
+        )
+
+        return None
+
+
+# ============================================================
+# 20. UPDATE CALIBRATION
+# ============================================================
+
+def update_calibration(
+    session,
+    hands,
+    now
+):
+    """Capture the fist pose, then the open-palm pose.
+
+    Both hands must be detected during capture. If there are not enough samples,
+    the current phase is repeated rather than saving an incomplete profile.
+    """
+
+    if not session["active"]:
+        return None
+
+    elapsed = now - session["phase_start"]
+
+    phase_duration = (
+        CALIBRATION_SETTLE_SECONDS
+        + CALIBRATION_CAPTURE_SECONDS
+    )
+
+    # Start collecting after the user has had time to position their hands.
+    if (
+        len(hands) >= 2
+        and elapsed >= CALIBRATION_SETTLE_SECONDS
+    ):
+
+        session["samples"].append(
+            collect_calibration_sample(hands)
+        )
+
+    # Wait for the whole capture period to finish.
+    if elapsed < phase_duration:
+        return None
+
+    # Repeat the phase if too few valid frames were collected.
+    if len(session["samples"]) < CALIBRATION_MIN_SAMPLES:
+
+        session["phase_start"] = now
+        session["samples"].clear()
+
+        session["notice"] = (
+            "Show BOTH hands clearly; repeating this pose."
+        )
+
+        print(session["notice"])
+
+        return None
+
+    # Save the first capture as the folded-finger reference.
+    if session["phase"] == 0:
+
+        session["closed_samples"] = (
+            session["samples"][:]
+        )
+
+        session["samples"].clear()
+
+        # Move to the open-palm phase.
+        session["phase"] = 1
+        session["phase_start"] = now
+
+        session["notice"] = (
+            "Good. Now spread all fingers on BOTH hands."
+        )
+
+        print(session["notice"])
+
+        return None
+
+    # Save the second capture as the extended-finger reference.
+    session["open_samples"] = (
+        session["samples"][:]
+    )
+
+    completed_profile = {}
+
+    # Build an independent classifier for each hand role.
+    for role in ROLE_NAMES:
+
+        closed_for_role = [
+            sample[role]
+            for sample in session["closed_samples"]
+        ]
+
+        open_for_role = [
+            sample[role]
+            for sample in session["open_samples"]
+        ]
+
+        completed_profile[role] = make_calibration_profile(
+            closed_for_role,
+            open_for_role
+        )
+
+    # Calibration is complete.
+    session["active"] = False
+
+    session["notice"] = (
+        "Calibration complete and saved."
+    )
+
+    save_calibration(completed_profile)
+
+    print(
+        "Calibration complete. Saved to:",
+        CALIBRATION_PATH
+    )
+
+    return completed_profile
+
+
+# ============================================================
+# 21. DETECT HANDS
+# ============================================================
+
+def detect_hands(
+    detector,
+    frame,
+    timestamp
+):
+    """Detect hands and return them sorted from left to right."""
+
+    # OpenCV supplies BGR; MediaPipe expects RGB.
     rgb_frame = cv2.cvtColor(
         frame,
         cv2.COLOR_BGR2RGB
     )
 
-    # Wrap the converted NumPy array in MediaPipe's image container.
+    # Convert the image into MediaPipe's image representation.
     mp_image = mp.Image(
         image_format=mp.ImageFormat.SRGB,
         data=rgb_frame
     )
 
-    # Run inference with a monotonically increasing timestamp.
+    # Run the video-mode detector.
     result = detector.detect_for_video(
         mp_image,
         timestamp
     )
 
-    # Store tuples of (horizontal center, image landmarks, world landmarks).
     hands = []
 
-    # No detected landmarks means there is nothing to classify this frame.
+    # If there are no hands, return an empty list.
     if not result.hand_landmarks:
         return hands
 
-    # Image and world landmark lists use the same hand index.
+    # Save image-space and world-space landmarks for each hand.
     for index, image_landmarks in enumerate(
         result.hand_landmarks
     ):
 
-        # World coordinates are used for geometry because they are less
-        # affected by the hand's position in the camera image.
-        world_landmarks = result.hand_world_landmarks[index]
+        if index >= len(result.hand_world_landmarks):
+            continue
 
-        # Average x gives a simple left-to-right position for role assignment.
+        world_landmarks = (
+            result.hand_world_landmarks[index]
+        )
+
+        # The average x coordinate identifies the hand's horizontal position.
         center_x = float(
             np.mean([
                 point.x
@@ -856,17 +1392,13 @@ def detect_hands(detector, frame, timestamp):
             ])
         )
 
-        # Keep image landmarks for drawing and world landmarks for recognition.
-        hands.append(
-            (
-                center_x,
-                image_landmarks,
-                world_landmarks
-            )
-        )
+        hands.append((
+            center_x,
+            image_landmarks,
+            world_landmarks
+        ))
 
-    # The first hand becomes the root hand and the second becomes the quality
-    # hand, making role selection deterministic from frame to frame.
+    # Screen-left hand is ROOT; screen-right hand is QUALITY.
     hands.sort(
         key=lambda hand: hand[0]
     )
@@ -875,98 +1407,176 @@ def detect_hands(detector, frame, timestamp):
 
 
 # ============================================================
-# 13. FINGER TRACING
+# 22. FINGER HISTORY AND SMOOTHING
+# ============================================================
+
+def create_finger_histories():
+    """Create an independent short history for every finger."""
+
+    return {
+        name: deque(maxlen=FINGER_HISTORY_SIZE)
+        for name in FINGER_NAMES
+    }
+
+
+def stabilize_fingers(raw_states, histories):
+    """Use majority voting to smooth each finger independently."""
+
+    stable_states = {}
+
+    for name, raw_value in raw_states.items():
+
+        # Store this frame's open/closed result.
+        histories[name].append(
+            bool(raw_value)
+        )
+
+        # Count open and closed observations.
+        open_votes = sum(
+            histories[name]
+        )
+
+        closed_votes = (
+            len(histories[name]) - open_votes
+        )
+
+        # The majority result becomes the stable finger state.
+        if open_votes > closed_votes:
+
+            stable_states[name] = True
+
+        elif closed_votes > open_votes:
+
+            stable_states[name] = False
+
+        else:
+
+            # Use the newest result if the votes are tied.
+            stable_states[name] = bool(raw_value)
+
+    return stable_states
+
+
+def stable_value(history):
+    """Return a complete gesture only when enough recent votes agree."""
+
+    if not history:
+        return None
+
+    value, votes = Counter(history).most_common(1)[0]
+
+    return (
+        value
+        if votes >= REQUIRED_GESTURE_VOTES
+        else None
+    )
+
+
+# ============================================================
+# 23. FINGERTIP TRAILS
 # ============================================================
 
 def create_trails():
-    """Create bounded fingertip paths used by the live hand overlay."""
+    """Create small queues for recent fingertip positions."""
 
-    # Each deque stores recent fingertip pixel positions for one trace line.
     return {
         name: deque(maxlen=12)
         for name in TRACE_LANDMARKS
     }
 
 
+# ============================================================
+# 24. DRAW HAND AND FINGER TRACING
+# ============================================================
+
 def draw_hand_landmarks(
     frame,
     landmarks,
     states,
-    trails
+    trails,
+    label
 ):
-    """Draw palm bones, colored fingers, fingertip trails, and labels.
+    """Draw the hand skeleton, colored finger bones, and fingertip trails.
 
-    Open fingers use the success color and closed fingers use the danger color.
-    The trail queues are mutated in place so the caller can reuse them across
-    frames without allocating a new path for every image.
+    Green means extended; red means folded. Different finger names are shown
+    beside the fingertips so the user can see what the program is recognizing.
     """
 
-    # Convert normalized landmark coordinates into this frame's pixels.
     height, width = frame.shape[:2]
 
-    # First draw the neutral palm skeleton behind the colored finger segments.
+    # --------------------------------------------------------
+    # DRAW THE PALM SKELETON
+    # --------------------------------------------------------
+
     for start, end in HAND_CONNECTIONS:
 
-        # Retrieve the two endpoints of the current bone.
         p1 = landmarks[start]
         p2 = landmarks[end]
 
-        # MediaPipe coordinates are normalized from 0 to 1.
-        x1 = int(p1.x * width)
-        y1 = int(p1.y * height)
+        start_point = (
+            int(p1.x * width),
+            int(p1.y * height)
+        )
 
-        x2 = int(p2.x * width)
-        y2 = int(p2.y * height)
+        end_point = (
+            int(p2.x * width),
+            int(p2.y * height)
+        )
 
-        # Draw one anti-aliased palm connection.
         cv2.line(
             frame,
-            (x1, y1),
-            (x2, y2),
-            (110, 125, 145),
+            start_point,
+            end_point,
+            (105, 120, 140),
             2,
             cv2.LINE_AA
         )
 
-    # Draw each finger using its current open/closed state.
+    # --------------------------------------------------------
+    # DRAW EACH FINGER
+    # --------------------------------------------------------
+
     for finger_name, indices in TRACE_LANDMARKS.items():
 
-        # Missing state is treated as closed for safe visual feedback.
+        # Determine the recognized state of this finger.
         is_open = states.get(
             finger_name,
             False
         )
 
-        # Green means extended; red means folded.
+        # Assign green to open fingers and red to folded fingers.
         color = (
-            SUCCESS
+            FINGER_COLORS[finger_name]
             if is_open
             else DANGER
         )
 
-        # Connect the finger's four landmarks one bone at a time.
-        for i in range(len(indices) - 1):
+        # Draw all three bones making up the finger.
+        for index in range(len(indices) - 1):
 
-            p1 = landmarks[indices[i]]
-            p2 = landmarks[indices[i + 1]]
+            p1 = landmarks[indices[index]]
+            p2 = landmarks[indices[index + 1]]
 
-            x1 = int(p1.x * width)
-            y1 = int(p1.y * height)
+            point1 = (
+                int(p1.x * width),
+                int(p1.y * height)
+            )
 
-            x2 = int(p2.x * width)
-            y2 = int(p2.y * height)
+            point2 = (
+                int(p2.x * width),
+                int(p2.y * height)
+            )
 
-            # Use a thicker colored line so the state is visible over the video.
             cv2.line(
                 frame,
-                (x1, y1),
-                (x2, y2),
+                point1,
+                point2,
                 color,
                 4,
                 cv2.LINE_AA
             )
 
-        # The final landmark is the fingertip used for the trail and marker.
+        # Obtain the fingertip position.
         tip = landmarks[indices[-1]]
 
         tip_position = (
@@ -974,23 +1584,22 @@ def draw_hand_landmarks(
             int(tip.y * height)
         )
 
-        # Save this tip position so motion remains visible over recent frames.
+        # Add this position to the movement history.
         trails[finger_name].append(
             tip_position
         )
 
-        # Convert the deque to a list for OpenCV's polyline API.
         trail_points = list(
             trails[finger_name]
         )
 
-        # A single point cannot form a line, so wait for at least two samples.
+        # Draw the recent fingertip path.
         if len(trail_points) >= 2:
 
             cv2.polylines(
                 frame,
                 [
-                    np.array(
+                    np.asarray(
                         trail_points,
                         dtype=np.int32
                     )
@@ -1001,32 +1610,35 @@ def draw_hand_landmarks(
                 cv2.LINE_AA
             )
 
-        # Draw a filled state-colored fingertip and a thin white outline.
+        # Draw a colored fingertip marker.
         cv2.circle(
             frame,
             tip_position,
-            8,
+            7,
             color,
-            -1
+            -1,
+            cv2.LINE_AA
         )
 
+        # Add a white outline.
         cv2.circle(
             frame,
             tip_position,
-            10,
+            9,
             TEXT,
-            1
+            1,
+            cv2.LINE_AA
         )
 
-        # Keep the label inside the image boundaries where possible.
+        # Position the three-letter finger label near the fingertip.
         label_x = min(
-            max(tip_position[0] + 8, 0),
-            width - 80
+            max(tip_position[0] + 7, 0),
+            max(0, width - 65)
         )
 
         label_y = max(
             tip_position[1] - 8,
-            20
+            18
         )
 
         cv2.putText(
@@ -1034,253 +1646,321 @@ def draw_hand_landmarks(
             finger_name[:3],
             (label_x, label_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.35,
+            0.34,
             color,
             1,
             cv2.LINE_AA
         )
 
+    # --------------------------------------------------------
+    # LABEL THE HAND ROLE
+    # --------------------------------------------------------
+
+    wrist = landmarks[0]
+
+    wrist_position = (
+        int(wrist.x * width),
+        int(wrist.y * height)
+    )
+
+    cv2.putText(
+        frame,
+        label,
+        (
+            max(5, wrist_position[0] - 35),
+            max(20, wrist_position[1] - 18)
+        ),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        GOLD,
+        1,
+        cv2.LINE_AA
+    )
+
 
 # ============================================================
-# 14. STABILIZE COMPLETE GESTURES
+# 25. DRAW DIAGNOSTICS
 # ============================================================
 
-def stable_value(history):
-    """Return the most-voted history value after enough votes accumulate."""
+def draw_debug(
+    frame,
+    root_data,
+    quality_data,
+    calibrated
+):
+    """Display the raw recognition measurements for both hands."""
 
-    # There is no meaningful winner before the first observation arrives.
-    if not history:
-        return None
+    # The first line tells the user whether their personal profile is active.
+    lines = [
+        "CALIBRATED"
+        if calibrated
+        else "FALLBACK - PRESS C TO CALIBRATE"
+    ]
 
-    # Count how often every complete gesture occurred in the recent window.
-    counts = Counter(history)
+    # Add one section for each detected hand.
+    for hand_label, data in (
+        ("ROOT", root_data),
+        ("QUALITY", quality_data)
+    ):
 
-    # Counter returns the most frequent value and its vote count first.
-    value, votes = counts.most_common(1)[0]
+        if data is None:
+            continue
 
-    # Require a minimum vote count so one transient frame cannot select a chord.
-    if votes >= REQUIRED_VOTES:
-        return value
+        lines.append(
+            f"{hand_label} HAND"
+        )
 
-    # The gesture is still undecided; the caller should keep the prior state.
-    return None
+        # Show state, joint angle, extension ratio, and confidence.
+        for finger, values in data.items():
+
+            state_text = (
+                "OPEN"
+                if values["open"]
+                else "CLOSED"
+            )
+
+            lines.append(
+                f"{finger[:3]} {state_text} "
+                f"A:{values['pip']:.0f} "
+                f"R:{values['ratio']:.2f} "
+                f"C:{values['confidence']:.2f}"
+            )
+
+    # Draw the collected diagnostic lines onto the camera image.
+    y = 105
+
+    for line in lines:
+
+        if line.startswith("FALLBACK"):
+            color = WARNING
+
+        elif "OPEN" in line:
+            color = SUCCESS
+
+        elif "CLOSED" in line:
+            color = MUTED
+
+        else:
+            color = GOLD if "HAND" in line else TEXT
+
+        cv2.putText(
+            frame,
+            line,
+            (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.34,
+            color,
+            1,
+            cv2.LINE_AA
+        )
+
+        y += 17
 
 
 # ============================================================
-# 15. SELECT CHORD
+# 26. SELECT A CHORD
 # ============================================================
 
-def select_chord(root_gesture, quality_count):
-    """Translate stabilized root and quality gestures into a chord key.
+def select_chord(
+    root_gesture,
+    quality_count
+):
+    """Translate the two stable hand gestures into a chord name."""
 
-    ``root_gesture`` stores the number of open non-thumb fingers and whether
-    the thumb is open.  The quality hand uses its open-finger count directly.
-    Invalid or incomplete combinations return ``None`` rather than selecting
-    a partial chord.
-    """
-
-    # Both hands must have a stable value before a chord can be selected.
+    # Both hands need valid gestures before a chord can be selected.
     if root_gesture is None or quality_count is None:
         return None
 
-    # Unpack the root gesture into its two independent controls.
+    # Unpack the root-hand gesture.
     root_count, thumb_open = root_gesture
 
-    # Convert the root hand gesture into a note name.
+    # Find the musical root note.
     root = ROOT_GESTURES.get(
         (bool(thumb_open), root_count)
     )
 
-    # Convert the quality hand's open-finger count into a chord quality.
+    # Find the chord quality.
     quality = QUALITY_GESTURES.get(
         quality_count
     )
 
-    # Unknown counts are intentionally rejected rather than guessed.
+    # Do not guess if either gesture is invalid.
     if root is None or quality is None:
         return None
 
-    # Chord dictionary keys are the root name followed by the quality name.
-    chord = root + quality
+    chord_name = root + quality
 
-    # Confirm the generated key exists before handing it to audio/UI code.
-    if chord in CHORDS:
-        return chord
-
-    # This is defensive: valid mappings should always produce a known chord.
-    return None
+    return (
+        chord_name
+        if chord_name in CHORDS
+        else None
+    )
 
 
 # ============================================================
-# 16. GENERATE CHORD AUDIO
+# 27. GENERATE CHORD AUDIO
 # ============================================================
 
-def generate_chord(frequencies, filename):
-    """Synthesize a normalized looping chord and write it as a mono WAV file.
+def generate_chord(
+    frequencies,
+    filename
+):
+    """Generate a harmonically enriched chord and save it as a WAV file."""
 
-    Each supplied fundamental frequency receives four harmonics.  The result
-    is normalized, attenuated, and given short fades at both ends to reduce
-    clicks when Windows loops the file.
-    """
-
-    # Convert duration and sample rate into the number of audio samples.
     sample_count = int(
         SAMPLE_RATE * LOOP_DURATION
     )
 
-    # Create one time value per sample for vectorized sine-wave generation.
+    # Create the time coordinate for every audio sample.
     time_values = (
-        np.arange(sample_count) / SAMPLE_RATE
+        np.arange(sample_count, dtype=np.float64)
+        / SAMPLE_RATE
     )
 
-    # Start with silence; each note and its harmonics will be added to it.
+    # Start with silence.
     audio = np.zeros(
         sample_count,
         dtype=np.float64
     )
 
-    # Add every chord tone to the same buffer.
+    # Add the fundamental and three harmonics of each chord note.
     for frequency in frequencies:
 
-        # The fundamental plus quieter harmonics produces a less sterile sound
-        # than a single pure sine wave.
-        note = (
-            np.sin(2 * np.pi * frequency * time_values)
-            + 0.30 * np.sin(2 * np.pi * frequency * 2 * time_values)
-            + 0.12 * np.sin(2 * np.pi * frequency * 3 * time_values)
-            + 0.05 * np.sin(2 * np.pi * frequency * 4 * time_values)
+        audio += (
+            np.sin(
+                2 * np.pi * frequency * time_values
+            )
+            + 0.30 * np.sin(
+                2 * np.pi * frequency * 2 * time_values
+            )
+            + 0.12 * np.sin(
+                2 * np.pi * frequency * 3 * time_values
+            )
+            + 0.05 * np.sin(
+                2 * np.pi * frequency * 4 * time_values
+            )
         )
 
-        # Superpose this note on the other chord tones.
-        audio += note
-
-    # Find the loudest sample so the summed waveform can be normalized safely.
-    maximum = np.max(
-        np.abs(audio)
+    # Normalize the audio to prevent clipping.
+    peak = float(
+        np.max(np.abs(audio))
     )
 
-    if maximum > 0:
-        # Prevent clipping caused by adding multiple notes together.
-        audio /= maximum
+    if peak > 0:
+        audio /= peak
 
-    # Leave headroom so the generated sound is not unnecessarily loud.
+    # Reduce the overall output volume.
     audio *= 0.65
 
-    # A short fade prevents an audible click at the loop boundaries.
+    # Fade the beginning and ending to reduce audible clicks.
     fade_size = int(
-        SAMPLE_RATE * 0.01
+        SAMPLE_RATE * 0.015
     )
 
     if fade_size > 0:
 
-        # Build a linear ramp from silence to full volume.
         fade = np.linspace(
-            0,
-            1,
+            0.0,
+            1.0,
             fade_size
         )
 
-        # Fade in at the beginning and fade out in reverse at the end.
         audio[:fade_size] *= fade
         audio[-fade_size:] *= fade[::-1]
 
-    # Convert floating-point amplitude [-1, 1] to signed 16-bit PCM samples.
-    audio = (
-        audio * 32767
+    # Convert floating-point samples to 16-bit PCM.
+    pcm = np.clip(
+        audio * 32767,
+        -32768,
+        32767
     ).astype(np.int16)
 
-    # Write a standard mono PCM WAV file understood by winsound.
+    # Write the WAV file.
     with wave.open(
         str(filename),
         "wb"
     ) as wav_file:
 
-        # One channel means the same sound is used for both speakers.
         wav_file.setnchannels(1)
-        # Two bytes per sample is 16-bit audio.
         wav_file.setsampwidth(2)
-        # Store the sample rate used to construct time_values.
         wav_file.setframerate(SAMPLE_RATE)
 
-        # Serialize the NumPy samples into the file payload.
         wav_file.writeframes(
-            audio.tobytes()
+            pcm.tobytes()
         )
 
 
 def create_chord_files():
-    """Create missing WAV files for every chord in ``CHORDS``."""
+    """Create WAV files for all chords that do not already have audio."""
 
-    # Create the output folder if this is the first run.
+    # Create the sound directory if it does not exist.
     SOUND_DIR.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    print("Preparing chord sounds...")
+    print("Preparing 21 chord sounds...")
 
-    # Generate each asset only once so later launches start quickly.
     for chord_name, chord_data in CHORDS.items():
 
-        # Every chord uses its dictionary key as its WAV filename.
-        filename = SOUND_DIR / f"{chord_name}.wav"
+        audio_path = (
+            SOUND_DIR / f"{chord_name}.wav"
+        )
 
-        if not filename.exists():
+        # Generate the sound only if it is missing.
+        if not audio_path.exists():
 
-            # Generate only missing files; existing files are preserved.
             generate_chord(
                 chord_data["frequencies"],
-                filename
+                audio_path
             )
 
-    print("All 21 chord sounds are ready.")
+    print("Chord sounds ready.")
 
 
 # ============================================================
-# 17. PLAY AND STOP AUDIO
+# 28. PLAY AND STOP CHORD AUDIO
 # ============================================================
 
 def stop_chord():
-    """Stop the currently looping Windows sound, when audio is available."""
+    """Stop any sound currently being played by winsound."""
 
-    # winsound is Windows-only; importing this file elsewhere should remain
-    # possible even when that optional module is unavailable.
     if winsound is None:
         return
 
     try:
 
-        # Passing None with SND_PURGE stops sounds started by winsound.
         winsound.PlaySound(
             None,
             winsound.SND_PURGE
         )
 
     except Exception:
-        # Stopping is best-effort during shutdown or device changes.
         pass
 
 
 def play_chord(chord_name):
-    """Asynchronously loop the generated WAV file for ``chord_name``."""
+    """Loop a valid chord WAV file asynchronously."""
 
-    # Do nothing when the platform has no Windows playback API.
-    if winsound is None:
+    if winsound is None or chord_name not in CHORDS:
         return
 
-    # Resolve the chord name to the WAV generated during startup.
-    filename = SOUND_DIR / f"{chord_name}.wav"
+    audio_path = (
+        SOUND_DIR / f"{chord_name}.wav"
+    )
 
-    # Missing assets should not crash the camera loop.
-    if not filename.exists():
+    if not audio_path.exists():
+
+        print(
+            f"Missing audio file: {audio_path}"
+        )
+
         return
 
     try:
 
-        # Play asynchronously so the UI can continue processing frames.
-        # LOOP keeps the chord sounding until stop_chord is called.
         winsound.PlaySound(
-            str(filename),
+            str(audio_path),
             winsound.SND_FILENAME
             | winsound.SND_ASYNC
             | winsound.SND_LOOP
@@ -1288,27 +1968,29 @@ def play_chord(chord_name):
 
     except Exception as error:
 
-        print("Audio playback error:", error)
+        print(
+            "Audio playback error:",
+            error
+        )
 
 
 # ============================================================
-# 18. DRAW TEXT
+# 29. DRAW TEXT
 # ============================================================
 
 def draw_text(
     image,
-    message,
+    text,
     position,
     scale=0.6,
     color=TEXT,
     thickness=1
 ):
-    """Render one anti-aliased text label using the application's font."""
+    """Draw anti-aliased text using OpenCV."""
 
-    # Convert arbitrary messages to strings because OpenCV requires text.
     cv2.putText(
         image,
-        str(message),
+        str(text),
         position,
         cv2.FONT_HERSHEY_SIMPLEX,
         scale,
@@ -1319,27 +2001,20 @@ def draw_text(
 
 
 # ============================================================
-# 19. PREPARE CAMERA VIEW
+# 30. PREPARE CAMERA VIEW
 # ============================================================
 
 def prepare_camera_view(frame):
-    """Fit the camera image into the left display panel.
+    """Fit the camera image into the left panel without stretching it."""
 
-    The foreground image preserves its aspect ratio.  A stretched and blurred
-    copy fills the panel behind it, preventing unused space from appearing as
-    a plain black border when camera and display ratios differ.
-    """
-
-    # Read the source image dimensions without changing the frame.
     height, width = frame.shape[:2]
 
-    # Choose the largest scale that fits both target dimensions.
+    # Choose the scale that fits both target dimensions.
     scale = min(
         CAMERA_VIEW_WIDTH / width,
         DISPLAY_HEIGHT / height
     )
 
-    # Clamp dimensions to at least one pixel for unusual camera inputs.
     new_width = max(
         1,
         int(width * scale)
@@ -1350,34 +2025,30 @@ def prepare_camera_view(frame):
         int(height * scale)
     )
 
-    # Preserve the camera aspect ratio in the foreground image.
+    # Keep the sharp camera image at its original aspect ratio.
     resized = cv2.resize(
         frame,
         (new_width, new_height)
     )
 
-    # Stretch a copy to fill the whole panel before blurring it.
+    # Create a blurred background that fills the whole panel.
     background = cv2.resize(
         frame,
         (CAMERA_VIEW_WIDTH, DISPLAY_HEIGHT)
     )
 
-    # Blur the stretched copy so it acts as a subtle backdrop rather than a
-    # visibly distorted duplicate of the camera image.
     background = cv2.GaussianBlur(
         background,
         (51, 51),
         0
     )
 
-    # Copy prevents later writes from modifying the resized background object.
     canvas = background.copy()
 
-    # Center the aspect-ratio-preserving foreground inside the panel.
+    # Center the sharp image.
     x = (CAMERA_VIEW_WIDTH - new_width) // 2
     y = (DISPLAY_HEIGHT - new_height) // 2
 
-    # Replace the centered area with the sharp camera image.
     canvas[
         y:y + new_height,
         x:x + new_width
@@ -1387,231 +2058,459 @@ def prepare_camera_view(frame):
 
 
 # ============================================================
-# 20. DRAW DIAGNOSTICS
+# 31. DRAW THE GUITAR FRETBOARD
 # ============================================================
 
-def draw_debug(
-    frame,
-    root_data,
-    quality_data
+def draw_fretboard(
+    panel,
+    chord_data
 ):
-    """Draw per-finger recognition measurements over the camera image.
+    """Draw six strings, fret lines, open/muted markers, and finger numbers."""
 
-    The diagnostic panel is intentionally derived from the latest raw
-    measurements rather than the stabilized state, so threshold behavior can
-    be inspected while tuning recognition.
-    """
+    fret_shape = chord_data["fret"]
+    fingers = chord_data["fingers"]
 
-    # Put the diagnostic heading above the per-finger measurements.
-    draw_text(
-        frame,
-        "FINGER DETECTION",
-        (10, 105),
-        0.48,
-        GOLD,
-        2
-    )
+    # Find the frets actually used by the chord.
+    fretted_notes = [
+        int(value)
+        for value in fret_shape
+        if value.isdigit() and value != "0"
+    ]
 
-    # y tracks the next free vertical text position.
-    y = 132
+    # Most chords start at fret 1.
+    first_fret = 1
 
-    # Render the two hands in the same order used for chord selection.
-    for hand_name, data in [
-        ("ROOT HAND", root_data),
-        ("QUALITY HAND", quality_data),
-    ]:
+    # Shift the diagram for chords positioned higher on the neck.
+    if fretted_notes and min(fretted_notes) > 1:
+        first_fret = min(fretted_notes)
 
-        # No hands or a lost hand has no measurements to display.
-        if data is None:
-            continue
-
-        # Identify which hand the following lines describe.
-        draw_text(
-            frame,
-            hand_name,
-            (10, y),
-            0.40,
-            MINT
+    # The diagram shows four fret spaces.
+    if (
+        fretted_notes
+        and max(fretted_notes) - first_fret > 3
+    ):
+        first_fret = max(
+            1,
+            max(fretted_notes) - 3
         )
 
-        y += 21
+    # Diagram coordinates.
+    x_left = 300
+    x_right = 590
+    top = 151
 
-        # Each values dictionary contains the geometry captured in the current
-        # frame, including the final open/closed decision.
-        for name, values in data.items():
+    fret_spacing = 25
 
-            # Convert the boolean state into a readable label and color.
-            status = (
-                "OPEN"
-                if values["open"]
-                else "CLOSED"
-            )
+    string_spacing = (
+        x_right - x_left
+    ) / 5
 
-            color = (
-                SUCCESS
-                if values["open"]
-                else MUTED
-            )
-
-            # Show the most useful tuning values:
-            # A = joint angle, R = extension ratio, S = weighted score.
-            message = (
-                f"{name}: {status} "
-                f"A:{values['pip']:.0f} "
-                f"R:{values['ratio']:.2f} "
-                f"S:{values['score']:.2f}"
-            )
-
-            draw_text(
-                frame,
-                message,
-                (10, y),
-                0.33,
-                color
-            )
-
-            y += 18
-
-        y += 6
-
-
-# ============================================================
-# 21. DRAW CHORD FINGER GUIDE
-# ============================================================
-
-def draw_finger_guide(panel, chord_data):
-    """Draw string names, fret positions, and finger assignments for a chord."""
-
-    # The guide is placed in the right half of the current-chord card.
     draw_text(
         panel,
-        "FINGER GUIDE",
-        (275, 137),
-        0.48,
+        "FRETBOARD",
+        (300, 133),
+        0.42,
         MINT,
         2
     )
 
-    # Six strings share a fixed horizontal grid.
-    start_x = 295
-    spacing = 46
+    # --------------------------------------------------------
+    # DRAW SIX GUITAR STRINGS
+    # --------------------------------------------------------
 
-    # Label each guitar string from low E to high e.
-    for i, string_name in enumerate(STRING_NAMES):
+    for index, string_name in enumerate(STRING_NAMES):
 
-        x = start_x + i * spacing
+        x = int(
+            x_left + index * string_spacing
+        )
 
-        # Labels in the first column explain the two rows below.
+        # Label the string.
         draw_text(
             panel,
             string_name,
-            (x, 163),
-            0.43,
+            (x - 4, top - 9),
+            0.35,
             GOLD,
-            2
+            1
         )
 
-    draw_text(
-        panel,
-        "FRET",
-        (260, 190),
-        0.36,
-        MUTED
-    )
+        # Draw its vertical line.
+        cv2.line(
+            panel,
+            (x, top),
+            (x, top + 4 * fret_spacing),
+            (185, 195, 210),
+            1,
+            cv2.LINE_AA
+        )
 
-    draw_text(
-        panel,
-        "FINGER",
-        (260, 218),
-        0.36,
-        MUTED
-    )
+    # --------------------------------------------------------
+    # DRAW FIVE HORIZONTAL FRET LINES
+    # --------------------------------------------------------
 
-    # Show the fret string supplied by the chord data.
-    for i, value in enumerate(chord_data["fret"]):
+    for row in range(5):
 
-        x = start_x + i * spacing
+        y = top + row * fret_spacing
 
-        # Muted strings are red, open strings are muted gray, and fretted
-        # strings use the normal text color.
-        if value.lower() == "x":
+        # Use a thicker nut line for chords starting at fret 1.
+        thickness = (
+            3
+            if row == 0 and first_fret == 1
+            else 1
+        )
 
-            color = DANGER
+        cv2.line(
+            panel,
+            (x_left, y),
+            (x_right, y),
+            (185, 195, 210),
+            thickness,
+            cv2.LINE_AA
+        )
 
-        elif value == "0":
-
-            color = MUTED
-
-        else:
-
-            color = TEXT
+    # Display the starting fret number when needed.
+    if first_fret > 1:
 
         draw_text(
             panel,
-            value,
-            (x, 190),
-            0.48,
-            color,
-            2
+            str(first_fret),
+            (278, top + 16),
+            0.36,
+            TEXT
         )
 
-    # Show which fretting-hand finger belongs on each string.
-    for i, finger in enumerate(chord_data["fingers"]):
+    # --------------------------------------------------------
+    # DETECT BARRE GROUPS
+    # --------------------------------------------------------
 
-        x = start_x + i * spacing
+    # Group strings held by the same finger at the same fret.
+    barre_groups = {}
 
-        # None means muted, zero means open, and 1-4 identify fingers.
-        if finger is None:
+    for string_index, (fret_value, finger) in enumerate(
+        zip(fret_shape, fingers)
+    ):
 
-            value = "X"
-            color = DANGER
+        if (
+            fret_value.isdigit()
+            and fret_value != "0"
+            and finger not in (None, 0)
+        ):
 
-        elif finger == 0:
+            key = (
+                int(fret_value),
+                finger
+            )
 
-            value = "-"
-            color = MUTED
+            barre_groups.setdefault(
+                key,
+                []
+            ).append(string_index)
 
-        else:
+    # Draw horizontal bars for adjacent strings.
+    for (barre_fret, finger), indices in barre_groups.items():
 
-            value = str(finger)
-            color = FINGER_COLORS[finger]
+        contiguous_groups = []
+        current_group = []
 
-        draw_text(
+        for string_index in indices:
+
+            if (
+                current_group
+                and string_index != current_group[-1] + 1
+            ):
+
+                contiguous_groups.append(
+                    current_group
+                )
+
+                current_group = []
+
+            current_group.append(
+                string_index
+            )
+
+        if current_group:
+            contiguous_groups.append(current_group)
+
+        # Only draw a barre when two or more adjacent strings share it.
+        for group in contiguous_groups:
+
+            if len(group) < 2:
+                continue
+
+            y = int(
+                top
+                + (barre_fret - first_fret + 0.5)
+                * fret_spacing
+            )
+
+            x1 = int(
+                x_left + group[0] * string_spacing
+            )
+
+            x2 = int(
+                x_left + group[-1] * string_spacing
+            )
+
+            cv2.line(
+                panel,
+                (x1, y),
+                (x2, y),
+                FINGER_NUMBER_COLORS[finger],
+                7,
+                cv2.LINE_AA
+            )
+
+    # --------------------------------------------------------
+    # DRAW OPEN STRINGS, MUTED STRINGS AND FINGER DOTS
+    # --------------------------------------------------------
+
+    for index, (fret_value, finger) in enumerate(
+        zip(fret_shape, fingers)
+    ):
+
+        x = int(
+            x_left + index * string_spacing
+        )
+
+        # Muted strings are marked with X.
+        if fret_value.lower() == "x":
+
+            draw_text(
+                panel,
+                "X",
+                (x - 5, top - 20),
+                0.40,
+                DANGER,
+                2
+            )
+
+            continue
+
+        fret_number = int(fret_value)
+
+        # Open strings receive a hollow circle above the nut.
+        if fret_number == 0:
+
+            cv2.circle(
+                panel,
+                (x, top - 16),
+                5,
+                MUTED,
+                1,
+                cv2.LINE_AA
+            )
+
+            continue
+
+        # Find the displayed fret position.
+        relative_fret = (
+            fret_number - first_fret
+        )
+
+        if not 0 <= relative_fret <= 3:
+            continue
+
+        # Finger dots are placed between the two fret lines.
+        y = int(
+            top + (relative_fret + 0.5) * fret_spacing
+        )
+
+        finger_color = FINGER_NUMBER_COLORS.get(
+            finger,
+            TEXT
+        )
+
+        cv2.circle(
             panel,
-            value,
-            (x, 218),
-            0.50,
-            color,
-            2
+            (x, y),
+            9,
+            finger_color,
+            -1,
+            cv2.LINE_AA
         )
 
+        # Write the finger number inside the dot.
+        if finger is not None:
+
+            draw_text(
+                panel,
+                str(finger),
+                (x - 4, y + 4),
+                0.30,
+                BACKGROUND,
+                1
+            )
+
+    # Finger legend.
     draw_text(
         panel,
-        "1 Index   2 Middle",
-        (275, 243),
-        0.36,
+        "1 Index  2 Middle  3 Ring  4 Pinky",
+        (286, 267),
+        0.31,
         TEXT
     )
 
     draw_text(
         panel,
-        "3 Ring    4 Pinky",
-        (445, 243),
-        0.36,
-        TEXT
-    )
-
-    draw_text(
-        panel,
-        "X = mute   - = open",
-        (275, 260),
-        0.34,
+        "X muted   O open",
+        (286, 282),
+        0.30,
         MUTED
     )
 
 
 # ============================================================
-# 22. DRAW RIGHT PANEL
+# 32. DRAW THE FINGER GUIDE
+# ============================================================
+
+def draw_finger_guide(
+    panel,
+    chord_data
+):
+    """Draw the title and graphical fretboard for the selected chord."""
+
+    draw_text(
+        panel,
+        "FINGER GUIDE",
+        (278, 119),
+        0.43,
+        MINT,
+        2
+    )
+
+    draw_fretboard(
+        panel,
+        chord_data
+    )
+
+
+# ============================================================
+# 33. CALIBRATION CARD
+# ============================================================
+
+def draw_calibration_card(
+    panel,
+    session,
+    now
+):
+    """Display calibration instructions and its progress bar."""
+
+    cv2.rectangle(
+        panel,
+        (18, 100),
+        (622, 286),
+        CARD,
+        -1
+    )
+
+    cv2.rectangle(
+        panel,
+        (18, 100),
+        (622, 286),
+        BORDER,
+        1
+    )
+
+    draw_text(
+        panel,
+        "PERSONAL HAND CALIBRATION",
+        (35, 132),
+        0.56,
+        MINT,
+        2
+    )
+
+    # Show the instruction matching the current calibration phase.
+    if session["phase"] == 0:
+
+        instruction = (
+            "1/2  Make a relaxed fist with BOTH hands."
+        )
+
+        detail = (
+            "Keep both thumbs tucked in. Hold still."
+        )
+
+    else:
+
+        instruction = (
+            "2/2  Open BOTH hands and spread all fingers."
+        )
+
+        detail = (
+            "Face your palms toward the camera. Hold still."
+        )
+
+    draw_text(
+        panel,
+        instruction,
+        (35, 175),
+        0.43,
+        TEXT
+    )
+
+    draw_text(
+        panel,
+        detail,
+        (35, 203),
+        0.40,
+        MUTED
+    )
+
+    # Calculate the progress after the settling interval.
+    elapsed = now - session["phase_start"]
+
+    progress = min(
+        1.0,
+        max(
+            0.0,
+            (
+                elapsed - CALIBRATION_SETTLE_SECONDS
+            ) / CALIBRATION_CAPTURE_SECONDS
+        )
+    )
+
+    # Draw the progress-bar background.
+    bar_x1 = 35
+    bar_y1 = 229
+    bar_x2 = 600
+    bar_y2 = 249
+
+    cv2.rectangle(
+        panel,
+        (bar_x1, bar_y1),
+        (bar_x2, bar_y2),
+        BORDER,
+        -1
+    )
+
+    # Calculate the width of the filled portion.
+    fill_x = (
+        bar_x1
+        + int((bar_x2 - bar_x1) * progress)
+    )
+
+    cv2.rectangle(
+        panel,
+        (bar_x1, bar_y1),
+        (fill_x, bar_y2),
+        SUCCESS,
+        -1
+    )
+
+    # Show the number of usable samples collected so far.
+    draw_text(
+        panel,
+        f"Samples collected: {len(session['samples'])}",
+        (35, 273),
+        0.36,
+        TEXT
+    )
+
+
+# ============================================================
+# 34. DRAW THE RIGHT-SIDE PANEL
 # ============================================================
 
 def draw_panel(
@@ -1620,24 +2519,22 @@ def draw_panel(
     playing_chord,
     root_gesture,
     quality_count,
-    hand_count
+    hand_count,
+    calibration_session,
+    calibration_loaded,
+    now
 ):
-    """Render the right-side application panel.
+    """Draw the chord card, chord guide, library, and application status."""
 
-    The panel contains the current chord, playback state, hand-role status,
-    finger-guide data, and a complete 7-by-3 chord library.  It writes into
-    the right slice of the supplied display image and therefore does not
-    allocate a second full-size canvas.
-    """
-
-    # Slice the right side without copying it; drawing here updates display.
+    # Work directly on the right half of the display.
     panel = display[:, CAMERA_VIEW_WIDTH:]
 
-    # Clear stale pixels from the previous frame.
     panel[:] = PANEL
 
+    # --------------------------------------------------------
     # HEADER
-    # Draw the application title and subtitle first.
+    # --------------------------------------------------------
+
     draw_text(
         panel,
         "VIRTUAL GUITAR",
@@ -1655,7 +2552,6 @@ def draw_panel(
         MUTED
     )
 
-    # Separate the header from the current chord card.
     cv2.line(
         panel,
         (20, 88),
@@ -1664,183 +2560,234 @@ def draw_panel(
         1
     )
 
-    # CURRENT CHORD CARD
-    # The card gives the user the selected chord and its fingering.
-    cv2.rectangle(
-        panel,
-        (18, 100),
-        (622, 268),
-        CARD,
-        -1
-    )
+    # --------------------------------------------------------
+    # CALIBRATION OR CURRENT CHORD
+    # --------------------------------------------------------
 
-    cv2.rectangle(
-        panel,
-        (18, 100),
-        (622, 268),
-        BORDER,
-        1
-    )
+    if calibration_session["active"]:
 
-    draw_text(
-        panel,
-        "CURRENT CHORD",
-        (35, 127),
-        0.40,
-        MUTED
-    )
-
-    # A selected chord gets detailed information; otherwise show instructions.
-    if active_chord:
-
-        chord_data = CHORDS[active_chord]
-
-        draw_text(
+        draw_calibration_card(
             panel,
-            active_chord,
-            (35, 181),
-            1.10,
-            MINT,
-            3
-        )
-
-        draw_text(
-            panel,
-            chord_data["quality"],
-            (35, 207),
-            0.48,
-            TEXT
-        )
-
-        draw_text(
-            panel,
-            "Fret: " + chord_data["fret"],
-            (35, 235),
-            0.44,
-            MUTED
-        )
-
-        draw_finger_guide(
-            panel,
-            chord_data
+            calibration_session,
+            now
         )
 
     else:
 
-        draw_text(
+        # Draw the current-chord card.
+        cv2.rectangle(
             panel,
-            "Waiting for gestures...",
-            (35, 185),
-            0.55,
-            MUTED
+            (18, 100),
+            (622, 286),
+            CARD,
+            -1
+        )
+
+        cv2.rectangle(
+            panel,
+            (18, 100),
+            (622, 286),
+            BORDER,
+            1
         )
 
         draw_text(
             panel,
-            "Finger guide appears when a chord is selected.",
-            (35, 222),
-            0.34,
+            "CURRENT CHORD",
+            (35, 127),
+            0.40,
             MUTED
         )
 
-    # Playback status is separate from selection because release grace time
-    # can leave a selected chord visible briefly after audio stops.
+        if active_chord:
+
+            chord_data = CHORDS[active_chord]
+
+            # Current chord name and quality.
+            draw_text(
+                panel,
+                active_chord,
+                (35, 181),
+                1.05,
+                MINT,
+                3
+            )
+
+            draw_text(
+                panel,
+                chord_data["quality"],
+                (35, 207),
+                0.46,
+                TEXT
+            )
+
+            draw_text(
+                panel,
+                "Shape: " + chord_data["fret"],
+                (35, 235),
+                0.40,
+                MUTED
+            )
+
+            # Show the graphical fretboard.
+            draw_finger_guide(
+                panel,
+                chord_data
+            )
+
+        else:
+
+            # Instructions displayed before a chord is selected.
+            draw_text(
+                panel,
+                "Waiting for gestures...",
+                (35, 183),
+                0.55,
+                MUTED
+            )
+
+            draw_text(
+                panel,
+                "Press C to calibrate your hands",
+                (35, 220),
+                0.40,
+                GOLD
+            )
+
+            draw_text(
+                panel,
+                "or use default recognition",
+                (35, 245),
+                0.36,
+                MUTED
+            )
+
+        # Show whether a personal calibration profile is loaded.
+        status = (
+            "CALIBRATED"
+            if calibration_loaded
+            else "NOT CALIBRATED - PRESS C"
+        )
+
+        status_color = (
+            SUCCESS
+            if calibration_loaded
+            else GOLD
+        )
+
+        draw_text(
+            panel,
+            status,
+            (35, 270),
+            0.31,
+            status_color
+        )
+
+    # --------------------------------------------------------
+    # AUDIO STATUS
+    # --------------------------------------------------------
+
     if playing_chord:
 
         draw_text(
             panel,
             "PLAYING",
-            (35, 255),
-            0.35,
-            SUCCESS
+            (500, 115),
+            0.32,
+            SUCCESS,
+            2
         )
 
-    else:
+    elif not calibration_session["active"]:
 
         draw_text(
             panel,
             "SOUND OFF",
-            (35, 255),
-            0.35,
+            (500, 115),
+            0.32,
             MUTED
         )
 
-    # HAND STATUS
-    # Show whether both role-defining hands are currently available.
+    # --------------------------------------------------------
+    # HAND STATUS AND CURRENT GESTURES
+    # --------------------------------------------------------
+
     draw_text(
         panel,
-        f"HANDS DETECTED: {hand_count}/2",
-        (22, 293),
-        0.43,
+        f"HANDS: {hand_count}/2",
+        (22, 309),
+        0.42,
         SUCCESS if hand_count >= 2 else GOLD,
         2
     )
 
     draw_text(
         panel,
-        "LEFT HAND: ROOT NOTE",
-        (22, 321),
-        0.40,
+        "LEFT HAND: ROOT",
+        (22, 337),
+        0.38,
         BLUE
     )
 
     draw_text(
         panel,
-        "RIGHT HAND: CHORD TYPE",
-        (320, 321),
-        0.40,
+        "RIGHT HAND: QUALITY",
+        (320, 337),
+        0.38,
         GOLD
     )
 
-    # Format the root hand's count and thumb switch for the user.
-    if root_gesture is not None:
+    # Display the root-hand count and thumb state.
+    if root_gesture is None:
 
-        root_count, thumb_open = root_gesture
+        root_text = "Waiting..."
 
-        thumb_text = (
+    else:
+
+        count, thumb_open = root_gesture
+
+        thumb_label = (
             "OPEN"
             if thumb_open
             else "CLOSED"
         )
 
         root_text = (
-            f"Fingers: {root_count} | Thumb: {thumb_text}"
+            f"Fingers: {count} | Thumb: {thumb_label}"
         )
-
-    else:
-
-        root_text = "Waiting for root hand..."
 
     draw_text(
         panel,
         root_text,
-        (22, 345),
-        0.37,
+        (22, 360),
+        0.35,
         TEXT
     )
 
-    # The quality hand is represented only by its non-thumb count.
+    # Display the quality-hand count.
     quality_text = (
-        f"Fingers: {quality_count}"
-        if quality_count is not None
-        else "Waiting for quality hand..."
+        "Waiting..."
+        if quality_count is None
+        else f"Fingers: {quality_count}"
     )
 
     draw_text(
         panel,
         quality_text,
-        (320, 345),
-        0.37,
+        (320, 360),
+        0.35,
         TEXT
     )
 
-    # CHORD LIBRARY
-    # Draw every valid root/quality combination as a selectable-looking cell.
+    # --------------------------------------------------------
+    # 21-CHORD LIBRARY
+    # --------------------------------------------------------
+
     draw_text(
         panel,
         "CHORD LIBRARY",
-        (22, 379),
-        0.53,
+        (22, 391),
+        0.50,
         TEXT,
         2
     )
@@ -1849,13 +2796,13 @@ def draw_panel(
     root_width = 65
     gap = 6
 
-    grid_top = 393
-    row_height = 35
+    grid_top = 402
+    row_height = 34
     row_gap = 1
 
     grid_right = 622
 
-    # Divide the remaining card width evenly among three quality columns.
+    # Divide the available width among the three qualities.
     chord_width = (
         grid_right
         - grid_left
@@ -1863,7 +2810,7 @@ def draw_panel(
         - 3 * gap
     ) // 3
 
-    # Each root occupies one row in the library.
+    # Each root note receives one row.
     for row, root in enumerate(ROOTS):
 
         y1 = grid_top + row * (
@@ -1883,13 +2830,13 @@ def draw_panel(
         draw_text(
             panel,
             root,
-            (grid_left + 24, y1 + 24),
-            0.55,
+            (grid_left + 24, y1 + 23),
+            0.53,
             MINT,
             2
         )
 
-        # Each row contains Major, Minor, and 7th cells.
+        # Draw Major, Minor, and 7th cells.
         for column, quality in enumerate(QUALITIES):
 
             x1 = (
@@ -1903,7 +2850,7 @@ def draw_panel(
 
             chord_name = root + quality
 
-            # Highlight only the currently active chord.
+            # Highlight the selected chord.
             cell_color = (
                 ACTIVE
                 if active_chord == chord_name
@@ -1935,32 +2882,34 @@ def draw_panel(
             draw_text(
                 panel,
                 label,
-                (x1 + 9, y1 + 23),
-                0.40,
+                (x1 + 9, y1 + 22),
+                0.39,
                 TEXT
             )
 
+    # --------------------------------------------------------
     # FOOTER
-    # Explain keyboard controls and advertise the catalogue size.
+    # --------------------------------------------------------
+
     draw_text(
         panel,
-        "SPACE: Replay | R: Reset | D: Diagnostics | Q: Quit",
-        (18, 680),
-        0.35,
+        "C: Calibrate | D: Debug | R: Reset | SPACE: Replay | Q: Quit",
+        (18, 679),
+        0.32,
         MUTED
     )
 
     draw_text(
         panel,
-        "21 AVAILABLE CHORDS",
-        (18, 708),
-        0.35,
-        MINT
+        "Green = extended   Red = folded   Orange = thumb",
+        (18, 706),
+        0.30,
+        MUTED
     )
 
 
 # ============================================================
-# 23. COMPOSE DISPLAY
+# 35. COMPOSE THE COMPLETE DISPLAY
 # ============================================================
 
 def compose_display(
@@ -1972,30 +2921,26 @@ def compose_display(
     hand_count,
     debug_enabled,
     root_diagnostics,
-    quality_diagnostics
+    quality_diagnostics,
+    calibration_session,
+    calibration_loaded,
+    now
 ):
-    """Assemble the camera view, optional diagnostics, and control panel.
+    """Combine the camera view, tracing overlay, and right-side UI."""
 
-    This function is presentation-only: it reads the current application state
-    and returns a fresh display image without changing gesture or audio state.
-    """
-
-    # Build the left camera panel before allocating the final UI canvas.
+    # Prepare the camera image for the left-side panel.
     camera_view = prepare_camera_view(frame)
 
-    # Use an 8-bit, three-channel image because OpenCV drawing expects BGR data.
+    # Create the complete display canvas.
     display = np.zeros(
         (DISPLAY_HEIGHT, DISPLAY_WIDTH, 3),
         dtype=np.uint8
     )
 
-    # Place the camera panel on the left.
     display[:, :CAMERA_VIEW_WIDTH] = camera_view
-
-    # Initialize the right panel background before draw_panel adds content.
     display[:, CAMERA_VIEW_WIDTH:] = PANEL
 
-    # Add a small legend above the camera feed.
+    # Camera-panel heading.
     draw_text(
         display,
         "HAND TRACKING",
@@ -2013,65 +2958,105 @@ def compose_display(
         MUTED
     )
 
-    # Diagnostics are optional because they occupy useful camera space.
-    if debug_enabled:
+    # Show calibration instructions over the camera during the wizard.
+    if calibration_session["active"]:
+
+        pose = (
+            "FISTS"
+            if calibration_session["phase"] == 0
+            else "OPEN PALMS"
+        )
+
+        draw_text(
+            display,
+            f"CALIBRATION: HOLD BOTH HANDS AS {pose}",
+            (15, 92),
+            0.40,
+            GOLD,
+            2
+        )
+
+    # Display debug measurements when diagnostics are enabled.
+    elif debug_enabled:
 
         draw_debug(
             display[:, :CAMERA_VIEW_WIDTH],
             root_diagnostics,
-            quality_diagnostics
+            quality_diagnostics,
+            calibration_loaded
         )
 
-    # The right panel receives all current gesture and playback state.
+    # Draw the right-side interface.
     draw_panel(
         display,
         active_chord,
         playing_chord,
         root_gesture,
         quality_count,
-        hand_count
+        hand_count,
+        calibration_session,
+        calibration_loaded,
+        now
     )
 
     return display
 
 
 # ============================================================
-# 24. MAIN APPLICATION
+# 36. MAIN APPLICATION
 # ============================================================
 
 def run_application():
-    """Run the camera, gesture-recognition, audio, and display event loop.
+    """Initialize the camera, detector, audio and real-time processing loop."""
 
-    Startup prepares chord audio, opens the camera, creates the detector, and
-    initializes all temporal state.  Each frame then detects hands, smooths
-    gestures, selects and plays chords, updates the UI, and handles keyboard
-    controls.  The ``finally`` block releases external resources even when the
-    loop exits because of an error.
-    """
+    print("=" * 48)
+    print("VIRTUAL GUITAR - PERSONAL CALIBRATION EDITION")
+    print("=" * 48)
 
-    # Print a startup banner so the terminal clearly identifies the program.
-    print("=" * 45)
-    print("VIRTUAL GUITAR")
-    print("=" * 45)
+    print(
+        "Chord catalogue validated:",
+        len(CHORDS),
+        "chords"
+    )
 
-    print("Total chords:", len(CHORDS))
-
-    # Warn early when the UI can run but sound playback cannot.
     if winsound is None:
-        print("WARNING: Windows audio playback unavailable.")
 
-    # Generate missing audio before entering the real-time loop.
+        print(
+            "WARNING: winsound is unavailable; audio playback is disabled."
+        )
+
+    # Generate the missing WAV files before starting the camera.
     create_chord_files()
+
+    # Load calibration if this computer has used the application before.
+    calibration_profiles = load_calibration()
+
+    calibration_loaded = (
+        calibration_profiles is not None
+    )
+
+    if calibration_loaded:
+
+        print("Personal calibration loaded.")
+
+    else:
+
+        print(
+            "No personal calibration found. Press C in the window to calibrate."
+        )
+
+    # --------------------------------------------------------
+    # OPEN CAMERA
+    # --------------------------------------------------------
 
     print("Opening camera...")
 
-    # Prefer DirectShow, which commonly gives better Windows camera behavior.
     camera = cv2.VideoCapture(
         CAMERA_INDEX,
         cv2.CAP_DSHOW
     )
 
-    # Fall back to OpenCV's default backend if DirectShow did not open it.
+    # Try the default backend if DirectShow fails.
     if not camera.isOpened():
 
         camera.release()
@@ -2080,15 +3065,13 @@ def run_application():
             CAMERA_INDEX
         )
 
-    # Do not continue with an invalid camera object.
     if not camera.isOpened():
 
         raise RuntimeError(
-            "Camera could not be opened. Check CAMERA_INDEX."
+            "Could not open camera. Check CAMERA_INDEX."
         )
 
-    # Request the configured capture dimensions.  The camera may negotiate a
-    # different supported size, so downstream code still reads frame.shape.
+    # Request the desired camera resolution.
     camera.set(
         cv2.CAP_PROP_FRAME_WIDTH,
         CAMERA_WIDTH
@@ -2099,15 +3082,19 @@ def run_application():
         CAMERA_HEIGHT
     )
 
+    # A small buffer reduces processing delay.
     camera.set(
         cv2.CAP_PROP_BUFFERSIZE,
         1
     )
 
-    # Create the detector only after camera startup has succeeded.
+    # Create the MediaPipe hand detector.
     detector = create_hand_detector()
 
-    # Create a resizable window for the composed display.
+    # --------------------------------------------------------
+    # CREATE APPLICATION WINDOW
+    # --------------------------------------------------------
+
     cv2.namedWindow(
         "VIRTUAL GUITAR",
         cv2.WINDOW_NORMAL
@@ -2119,209 +3106,305 @@ def run_application():
         DISPLAY_HEIGHT
     )
 
-    # Complete gestures are voted over recent frames.
+    # --------------------------------------------------------
+    # INITIALIZE HISTORY QUEUES
+    # --------------------------------------------------------
+
+    # Complete gesture history.
     root_history = deque(
-        maxlen=HISTORY_SIZE
+        maxlen=GESTURE_HISTORY_SIZE
     )
 
     quality_history = deque(
-        maxlen=HISTORY_SIZE
+        maxlen=GESTURE_HISTORY_SIZE
     )
 
-    # Individual fingers are smoothed before their states are counted.
+    # Individual finger histories.
     root_finger_histories = create_finger_histories()
 
     quality_finger_histories = create_finger_histories()
 
-    # Previous states enable hysteresis in the geometric recognizer.
+    # Previous finger states support hysteresis.
     root_previous_states = {}
     quality_previous_states = {}
 
-    # Fingertip trails persist across frames for visual feedback.
+    # Fingertip movement trails.
     root_trails = create_trails()
     quality_trails = create_trails()
 
-    # No stable gesture exists until enough frames agree.
+    # Calibration wizard state.
+    calibration_session = create_calibration_session()
+
+    # Current gesture states.
     root_gesture = None
     quality_count = None
 
+    # Diagnostic measurements.
     root_diagnostics = None
     quality_diagnostics = None
 
-    # Selection and playback are tracked separately because release grace time
-    # can keep the selected chord visible after sound stops.
+    # Current selected chord and currently playing chord.
     active_chord = None
     playing_chord = None
 
-    # The D key toggles raw recognition diagnostics.
+    # Diagnostics begin disabled.
     debug_enabled = False
 
-    # MediaPipe VIDEO mode requires strictly increasing timestamps.
+    # Video-mode MediaPipe timestamps must increase on every frame.
     last_timestamp = 0
 
-    # Monotonic times drive the release and hand-loss grace periods.
-    last_valid_chord_time = 0
-    last_two_hand_time = 0
+    # Remember audio-release and last-two-hand times.
+    last_valid_chord_time = 0.0
+    last_two_hand_time = 0.0
 
-    print("\nROOT HAND:")
-    print("Thumb CLOSED + 0 fingers = C")
-    print("Thumb CLOSED + 1 finger  = D")
-    print("Thumb CLOSED + 2 fingers = E")
-    print("Thumb CLOSED + 3 fingers = F")
-    print("Thumb CLOSED + 4 fingers = G")
-    print("Thumb OPEN + 0 fingers   = A")
-    print("Thumb OPEN + 1 finger    = B")
+    # --------------------------------------------------------
+    # PRINT INSTRUCTIONS
+    # --------------------------------------------------------
 
-    print("\nQUALITY HAND:")
-    print("1 finger = MAJOR")
-    print("2 fingers = MINOR")
-    print("3 fingers = 7TH")
+    print("\nLEFT / SCREEN-LEFT HAND:")
+    print("Thumb closed + 0/1/2/3/4 fingers = C/D/E/F/G")
+    print("Thumb open + 0/1 fingers = A/B")
 
-    print("\nCONTROLS:")
-    print("D = Diagnostics")
-    print("R = Reset")
-    print("SPACE = Replay")
-    print("Q = Quit")
+    print("\nRIGHT / SCREEN-RIGHT HAND:")
+    print("1 finger = Major | 2 = Minor | 3 = 7th")
+
+    print("\nPress C to calibrate:")
+    print("BOTH fists first, BOTH open palms second.")
+
+    print("\nD = diagnostics")
+    print("R = reset")
+    print("SPACE = replay")
+    print("Q/ESC = quit")
+
+    # ========================================================
+    # MAIN FRAME LOOP
+    # ========================================================
 
     try:
 
-        # Keep processing frames until the camera fails or Q is pressed.
         while True:
 
-            # Read the newest frame from the camera.
+            # ------------------------------------------------
+            # READ CAMERA FRAME
+            # ------------------------------------------------
+
             success, frame = camera.read()
 
-            # A failed read cannot be passed safely to OpenCV or MediaPipe.
             if not success or frame is None:
 
                 print("Could not read camera frame.")
                 break
 
-            # Mirror the camera so movement matches the user's perspective.
+            # Mirror camera image.
             frame = cv2.flip(
                 frame,
                 1
             )
 
-            # Monotonic time is safe for measuring elapsed durations.
-            current_time = time.monotonic()
+            # Monotonic time is used for elapsed-time measurements.
+            now = time.monotonic()
 
-            # MediaPipe expects video timestamps in milliseconds.
-            timestamp = int(
-                current_time * 1000
-            )
+            # MediaPipe requires timestamps in increasing milliseconds.
+            timestamp = int(now * 1000)
 
-            # Ensure two quick frames never reuse the same timestamp.
             if timestamp <= last_timestamp:
                 timestamp = last_timestamp + 1
 
             last_timestamp = timestamp
 
-            # Detect hands and sort them from left to right.
+            # Detect and sort hands.
             hands = detect_hands(
                 detector,
                 frame,
                 timestamp
             )
 
-            # The UI displays this even when there are fewer than two hands.
             hand_count = len(hands)
 
             # ------------------------------------------------
-            # TWO HANDS DETECTED
+            # CALIBRATION MODE
             # ------------------------------------------------
 
-            # Chord recognition requires both the root and quality hands.
-            if hand_count >= 2:
+            if calibration_session["active"]:
 
-                # Remember the latest time when both hands were available.
-                last_two_hand_time = current_time
+                # Draw visible hands during calibration.
+                for hand_index, hand in enumerate(hands[:2]):
 
-                # detect_hands sorted these roles consistently.
+                    role = (
+                        "ROOT"
+                        if hand_index == 0
+                        else "QUALITY"
+                    )
+
+                    old_states = (
+                        root_previous_states
+                        if role == "ROOT"
+                        else quality_previous_states
+                    )
+
+                    # Use the existing calibration profile for display if available.
+                    role_profile = (
+                        calibration_profiles[role]
+                        if calibration_profiles is not None
+                        else None
+                    )
+
+                    _, visible_states, _ = recognize_fingers(
+                        hand[2],
+                        old_states,
+                        role_profile
+                    )
+
+                    trails = (
+                        root_trails
+                        if role == "ROOT"
+                        else quality_trails
+                    )
+
+                    draw_hand_landmarks(
+                        frame,
+                        hand[1],
+                        visible_states,
+                        trails,
+                        role
+                    )
+
+                # Collect the current calibration samples.
+                completed_profile = update_calibration(
+                    calibration_session,
+                    hands,
+                    now
+                )
+
+                # If calibration finished, switch to the newly learned profiles.
+                if completed_profile is not None:
+
+                    calibration_profiles = completed_profile
+                    calibration_loaded = True
+
+                    # Clear old gesture measurements so the new classifier
+                    # begins with a clean history.
+                    root_history.clear()
+                    quality_history.clear()
+
+                    root_finger_histories = create_finger_histories()
+                    quality_finger_histories = create_finger_histories()
+
+                    root_previous_states.clear()
+                    quality_previous_states.clear()
+
+                    root_gesture = None
+                    quality_count = None
+
+                    root_diagnostics = None
+                    quality_diagnostics = None
+
+            # ------------------------------------------------
+            # NORMAL TWO-HAND RECOGNITION
+            # ------------------------------------------------
+
+            elif hand_count >= 2:
+
+                last_two_hand_time = now
+
+                # Left-most hand selects the root note.
+                # Right-most hand selects chord quality.
                 root_hand = hands[0]
                 quality_hand = hands[1]
 
-                # Image landmarks are used for drawing colored bones.
-                root_image = root_hand[1]
-                # World landmarks are used for scale-independent geometry.
-                root_world = root_hand[2]
+                # Use each hand's own calibration profile.
+                root_profile = (
+                    calibration_profiles["ROOT"]
+                    if calibration_profiles is not None
+                    else None
+                )
 
-                # Repeat the same split for the quality hand.
-                quality_image = quality_hand[1]
-                quality_world = quality_hand[2]
+                quality_profile = (
+                    calibration_profiles["QUALITY"]
+                    if calibration_profiles is not None
+                    else None
+                )
 
-                # ROOT HAND: RAW RECOGNITION.
-                # Classify this frame before applying temporal smoothing.
+                # --------------------------------------------
+                # ROOT HAND DETECTION
+                # --------------------------------------------
+
                 (
                     _,
                     root_raw_states,
                     root_diagnostics
                 ) = recognize_fingers(
-                    root_world,
-                    root_previous_states
+                    root_hand[2],
+                    root_previous_states,
+                    root_profile
                 )
 
-                # ROOT HAND: TEMPORAL SMOOTHING.
-                # Majority voting suppresses one-frame landmark noise.
+                # Smooth the five individual finger results.
                 root_states = stabilize_fingers(
                     root_raw_states,
                     root_finger_histories
                 )
 
-                # Feed the stabilized result into the next frame's hysteresis.
                 root_previous_states = root_states
 
-                # Count only index through pinky; the thumb is a separate root
-                # selector for A/B versus C-G.
+                # Count index, middle, ring, and pinky.
                 root_count = sum(
                     root_states[name]
                     for name in FINGER_LANDMARKS
                 )
 
-                # QUALITY HAND: RAW RECOGNITION.
-                # Reuse the same classifier for the second hand.
+                # --------------------------------------------
+                # QUALITY HAND DETECTION
+                # --------------------------------------------
+
                 (
                     _,
                     quality_raw_states,
                     quality_diagnostics
                 ) = recognize_fingers(
-                    quality_world,
-                    quality_previous_states
+                    quality_hand[2],
+                    quality_previous_states,
+                    quality_profile
                 )
 
-                # QUALITY HAND: TEMPORAL SMOOTHING.
                 quality_states = stabilize_fingers(
                     quality_raw_states,
                     quality_finger_histories
                 )
 
-                # Preserve the stabilized result for the next recognition call.
                 quality_previous_states = quality_states
 
-                # Quality uses the non-thumb count directly.
+                # Count open non-thumb fingers.
                 quality_detected = sum(
                     quality_states[name]
                     for name in FINGER_LANDMARKS
                 )
 
-                # DRAW FINGER TRACES.
-                # Both overlays are drawn onto the camera frame in place.
+                # --------------------------------------------
+                # DRAW BOTH HANDS
+                # --------------------------------------------
+
                 draw_hand_landmarks(
                     frame,
-                    root_image,
+                    root_hand[1],
                     root_states,
-                    root_trails
+                    root_trails,
+                    "ROOT"
                 )
 
                 draw_hand_landmarks(
                     frame,
-                    quality_image,
+                    quality_hand[1],
                     quality_states,
-                    quality_trails
+                    quality_trails,
+                    "QUALITY"
                 )
 
-                # SAVE GESTURES.
-                # Store complete inputs separately from individual finger data.
+                # --------------------------------------------
+                # STORE COMPLETE GESTURES
+                # --------------------------------------------
+
+                # Root history stores both count and thumb state.
                 root_history.append(
                     (
                         root_count,
@@ -2329,12 +3412,12 @@ def run_application():
                     )
                 )
 
+                # Quality history stores the number of open fingers.
                 quality_history.append(
                     quality_detected
                 )
 
-                # STABILIZE COMPLETE GESTURES.
-                # A value is returned only after enough recent votes agree.
+                # Get stable complete gestures.
                 root_gesture = stable_value(
                     root_history
                 )
@@ -2343,24 +3426,21 @@ def run_application():
                     quality_history
                 )
 
-                # SELECT CHORD.
-                # Combine root and quality into a catalogue key.
+                # --------------------------------------------
+                # SELECT AND PLAY CHORD
+                # --------------------------------------------
+
                 selected_chord = select_chord(
                     root_gesture,
                     quality_count
                 )
 
-                # Invalid or incomplete inputs leave the last valid selection
-                # unchanged.
                 if selected_chord is not None:
 
-                    # Show the newest valid chord immediately.
                     active_chord = selected_chord
+                    last_valid_chord_time = now
 
-                    # Refresh the audio release timer while the input is valid.
-                    last_valid_chord_time = current_time
-
-                    # Do not restart the same looping sound every camera frame.
+                    # Do not restart the audio if the chord is unchanged.
                     if playing_chord != active_chord:
 
                         stop_chord()
@@ -2372,58 +3452,115 @@ def run_application():
                         playing_chord = active_chord
 
             # ------------------------------------------------
-            # HANDS TEMPORARILY LOST
+            # ONE HAND OR NO HANDS
             # ------------------------------------------------
 
-            # A brief detection gap is tolerated; a longer gap resets state.
-            elif (
-                current_time - last_two_hand_time
-                > HAND_LOST_GRACE_SECONDS
-            ):
+            else:
 
-                # Discard stale complete-gesture votes.
-                root_history.clear()
-                quality_history.clear()
+                # Draw and recognize a single hand for visual feedback.
+                if hand_count == 1:
 
-                # Discard stale hysteresis state because the next hands may be
-                # different people or orientations.
-                root_previous_states.clear()
-                quality_previous_states.clear()
+                    hand = hands[0]
 
-                # Start new smoothing windows after prolonged hand loss.
-                root_finger_histories = create_finger_histories()
+                    # Select role based on which side of the image contains it.
+                    if hand[0] < 0.5:
 
-                quality_finger_histories = create_finger_histories()
+                        role = "ROOT"
+                        old_states = root_previous_states
 
-                # Clear trails so old fingertips do not remain on screen.
-                root_trails = create_trails()
-                quality_trails = create_trails()
+                        finger_histories = root_finger_histories
 
-                root_gesture = None
-                quality_count = None
+                        role_profile = (
+                            calibration_profiles["ROOT"]
+                            if calibration_profiles is not None
+                            else None
+                        )
 
-                root_diagnostics = None
-                quality_diagnostics = None
+                        trails = root_trails
+
+                    else:
+
+                        role = "QUALITY"
+                        old_states = quality_previous_states
+
+                        finger_histories = quality_finger_histories
+
+                        role_profile = (
+                            calibration_profiles["QUALITY"]
+                            if calibration_profiles is not None
+                            else None
+                        )
+
+                        trails = quality_trails
+
+                    # Recognize the visible hand.
+                    _, raw_states, diagnostics = recognize_fingers(
+                        hand[2],
+                        old_states,
+                        role_profile
+                    )
+
+                    visible_states = stabilize_fingers(
+                        raw_states,
+                        finger_histories
+                    )
+
+                    # Update diagnostics and previous states for the matching role.
+                    if role == "ROOT":
+
+                        root_previous_states = visible_states
+                        root_diagnostics = diagnostics
+
+                    else:
+
+                        quality_previous_states = visible_states
+                        quality_diagnostics = diagnostics
+
+                    # Draw the visible hand.
+                    draw_hand_landmarks(
+                        frame,
+                        hand[1],
+                        visible_states,
+                        trails,
+                        role
+                    )
+
+                # Clear old votes after both hands have been missing for a while.
+                if now - last_two_hand_time > HAND_LOST_GRACE_SECONDS:
+
+                    root_history.clear()
+                    quality_history.clear()
+
+                    root_previous_states.clear()
+                    quality_previous_states.clear()
+
+                    root_finger_histories = create_finger_histories()
+                    quality_finger_histories = create_finger_histories()
+
+                    root_trails = create_trails()
+                    quality_trails = create_trails()
+
+                    root_gesture = None
+                    quality_count = None
+
+                    root_diagnostics = None
+                    quality_diagnostics = None
 
             # ------------------------------------------------
-            # STOP AUDIO AFTER RELEASE
-            # Keep sound alive briefly in case the detector misses one frame.
+            # AUDIO RELEASE
             # ------------------------------------------------
 
+            # Stop the sound after the gesture has disappeared for long enough.
             if (
                 playing_chord is not None
-                and current_time - last_valid_chord_time
-                > RELEASE_GRACE_SECONDS
+                and now - last_valid_chord_time > RELEASE_GRACE_SECONDS
             ):
 
-                # Stop only after the configured release grace interval.
                 stop_chord()
-
                 playing_chord = None
 
             # ------------------------------------------------
-            # DISPLAY
-            # Compose and show the current camera/UI state.
+            # DRAW USER INTERFACE
             # ------------------------------------------------
 
             display = compose_display(
@@ -2435,30 +3572,51 @@ def run_application():
                 hand_count,
                 debug_enabled,
                 root_diagnostics,
-                quality_diagnostics
+                quality_diagnostics,
+                calibration_session,
+                calibration_loaded,
+                now
             )
 
-            # OpenCV presents the composed BGR image in the named window.
             cv2.imshow(
                 "VIRTUAL GUITAR",
                 display
             )
 
-            # ------------------------------------------------
-            # KEYBOARD CONTROLS
-            # waitKey refreshes the window and returns the pressed key code.
-            # ------------------------------------------------
-
+            # Read keyboard input.
             key = cv2.waitKey(1) & 0xFF
 
-            # Q exits the loop and proceeds to cleanup.
-            if key == ord("q"):
+            # ------------------------------------------------
+            # KEYBOARD CONTROLS
+            # ------------------------------------------------
 
-                break
+            if key == ord("c"):
 
-            # D toggles the detailed raw-finger diagnostics.
+                # Press C during calibration to cancel it.
+                if calibration_session["active"]:
+
+                    cancel_calibration(
+                        calibration_session
+                    )
+
+                    print("Calibration cancelled.")
+
+                else:
+
+                    # Stop playback before entering calibration.
+                    stop_chord()
+
+                    playing_chord = None
+                    active_chord = None
+
+                    start_calibration(
+                        calibration_session,
+                        time.monotonic()
+                    )
+
             elif key == ord("d"):
 
+                # Toggle debug measurements.
                 debug_enabled = not debug_enabled
 
                 print(
@@ -2466,9 +3624,9 @@ def run_application():
                     "ON" if debug_enabled else "OFF"
                 )
 
-            # R clears current gesture, chord, and playback state.
             elif key == ord("r"):
 
+                # Clear gesture histories and stop playback.
                 root_history.clear()
                 quality_history.clear()
 
@@ -2476,7 +3634,6 @@ def run_application():
                 quality_previous_states.clear()
 
                 root_finger_histories = create_finger_histories()
-
                 quality_finger_histories = create_finger_histories()
 
                 root_trails = create_trails()
@@ -2491,76 +3648,74 @@ def run_application():
                 root_diagnostics = None
                 quality_diagnostics = None
 
-                last_valid_chord_time = 0
+                last_valid_chord_time = 0.0
 
                 stop_chord()
 
-                print("Reset complete.")
+                print("Gesture and audio state reset.")
 
-            # Space manually replays the currently selected chord.
-            elif key == 32:
+            elif (
+                key == 32
+                and active_chord is not None
+                and not calibration_session["active"]
+            ):
 
-                if active_chord is not None:
+                # SPACE manually replays the currently selected chord.
+                stop_chord()
 
-                    stop_chord()
+                play_chord(
+                    active_chord
+                )
 
-                    play_chord(
-                        active_chord
-                    )
+                playing_chord = active_chord
+                last_valid_chord_time = now
 
-                    playing_chord = active_chord
+            elif key in (ord("q"), 27):
 
-                    last_valid_chord_time = current_time
+                # Q or Escape exits the application.
+                break
 
     finally:
 
-        # Cleanup runs for normal exit and exceptions alike.
+        # Always stop audio and release camera/model/window resources.
         print("Closing Virtual Guitar...")
 
-        # Stop any asynchronously looping sound first.
         stop_chord()
 
-        # Release native camera and MediaPipe resources.
         camera.release()
         detector.close()
 
-        # Remove the GUI window created by OpenCV.
         cv2.destroyAllWindows()
 
         print("Application closed.")
 
 
 # ============================================================
-# 25. START PROGRAM
+# 37. PROGRAM ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
 
-    # This guard prevents the camera from opening when the module is imported
-    # for testing or for reuse of its chord/recognition helpers.
     try:
 
-        # Start the complete interactive application.
+        # Start the complete application.
         run_application()
 
     except KeyboardInterrupt:
 
-        # Treat Ctrl+C as a normal user-initiated shutdown.
+        # Treat Ctrl+C as a normal shutdown.
         print("\nApplication interrupted.")
 
-        # Ensure no sound or window survives the interruption.
         stop_chord()
         cv2.destroyAllWindows()
 
     except Exception as error:
 
-        # Print a short human-readable error before re-raising it for debugging.
+        # Print the error and preserve the complete traceback.
         print("\nAPPLICATION ERROR:")
         print(error)
 
-        # Perform best-effort UI/audio cleanup on unexpected failures.
         stop_chord()
         cv2.destroyAllWindows()
 
-        # Re-raise so the original traceback and exit status are preserved.
         raise
