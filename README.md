@@ -1,9 +1,9 @@
 # HandChordAI
 
 HandChordAI is a Windows desktop virtual guitar that turns two-hand gestures
-into guitar chords. It uses a webcam to track hand landmarks, interprets the
-number of extended fingers on each hand, and plays a synthesized chord when a
-stable gesture is recognized.
+into guitar chords. It uses a webcam to track hand landmarks, interprets
+finger poses, and loops a guitar sound when a stable chord gesture is
+recognized.
 
 The application is implemented in [HandChordAI.py](./HandChordAI.py) with
 OpenCV, MediaPipe, NumPy, and Python's built-in audio/file modules.
@@ -11,18 +11,22 @@ OpenCV, MediaPipe, NumPy, and Python's built-in audio/file modules.
 ## Features
 
 - Real-time webcam hand tracking for up to two hands.
-- Left-hand gesture selection for the chord root: E, C, G, D, or A.
-- Right-hand gesture selection for chord quality: major, minor, or dominant
-  seventh.
-- 15 supported chords: five roots multiplied by three qualities.
-- Procedurally generated, strummed-style WAV audio with harmonics and
-  attack/decay envelopes.
+- Left-hand gesture selection for seven roots: C, D, E, F, G, A, or B.
+- Right-hand gesture selection for major, minor, or dominant seventh quality.
+- 21 supported chords: seven roots multiplied by three qualities.
+- Pre-generated strummed-style WAV audio stored in `sounds_v3`, with missing
+  files generated automatically at startup.
+- A six-pose personal calibration wizard that improves finger recognition for
+  each hand and saves its profiles in `finger_calibration.json`.
+- One-Euro filtering and temporal smoothing for steadier hand and finger
+  tracking.
 - On-screen studio interface showing detected hands, finger states, the active
   chord, notes, guitar fingering, and FPS.
+- An in-app gesture guide (`G`) and optional diagnostic overlay (`D`).
 - Gesture stabilization using a rolling history and majority voting to reduce
   accidental chord changes.
-- Optional diagnostic overlays for finger angles, ratios, scores, and
-  recognition state.
+- Chord playback stops shortly after the hands leave the frame or both gestures
+  are released.
 - Automatic download of the MediaPipe hand-landmarker model on first launch.
 
 ## Gesture controls
@@ -31,28 +35,36 @@ The application assigns hands by their position on the mirrored camera image:
 
 | Hand | Extended fingers | Selection |
 | --- | ---: | --- |
-| Left | 0 | E root |
-| Left | 1 | C root |
-| Left | 2 | G root |
-| Left | 3 | D root |
-| Left | 4 | A root |
-| Right | 1 | Major |
-| Right | 2 | Minor |
-| Right | 3 | Dominant 7th |
+| Left / root | Fist, thumb tucked | C |
+| Left / root | Index up | D |
+| Left / root | Index and middle up | E |
+| Left / root | Index, middle, and ring up | F |
+| Left / root | All four fingers up | G |
+| Left / root | Thumb out only | A |
+| Left / root | Thumb and index up | B |
+| Right / quality | Index up | Major |
+| Right / quality | Index and middle up | Minor |
+| Right / quality | Index, middle, and ring up | Dominant 7th |
 
 Hold both gestures steadily until the interface recognizes them. The selected
-chord is played once when it becomes active. A short cooldown prevents repeated
-playback while the same gesture remains in view.
+chord starts looping when it becomes active and restarts only when the chord
+changes.
+
+The thumb on the right/quality hand is ignored. Press `C` to start or cancel
+the calibration wizard. Calibration is saved beside the script and is loaded
+automatically on the next run.
 
 ## Supported chords
 
 | Root | Major | Minor | 7th |
 | --- | --- | --- | --- |
-| C | C major (`x32010`) | C minor (`x35543`) | C7 (`x32310`) |
-| G | G major (`320003`) | G minor (`355333`) | G7 (`320001`) |
-| D | D major (`xx0232`) | D minor (`xx0231`) | D7 (`xx0212`) |
-| A | A major (`x02220`) | A minor (`x02210`) | A7 (`x02020`) |
-| E | E major (`022100`) | E minor (`022000`) | E7 (`022130`) |
+| C | C (`x32010`) | Cm (`x35543`) | C7 (`x32310`) |
+| D | D (`xx0232`) | Dm (`xx0231`) | D7 (`xx0212`) |
+| E | E (`022100`) | Em (`022000`) | E7 (`020100`) |
+| F | F (`133211`) | Fm (`133111`) | F7 (`131211`) |
+| G | G (`320003`) | Gm (`355333`) | G7 (`320001`) |
+| A | A (`x02220`) | Am (`x02210`) | A7 (`x02020`) |
+| B | B (`x24442`) | Bm (`x24432`) | B7 (`x21202`) |
 
 The displayed fret strings use standard guitar chord notation, where `x`
 indicates a muted string and `0` indicates an open string.
@@ -89,19 +101,22 @@ interpreter directly:
 python HandChordAI.py
 ```
 
-At startup the program generates the chord WAV files in the `sounds` folder,
-opens the webcam, and downloads `hand_landmarker.task` beside the script if it
-is not already present. The generated audio and downloaded model are local
-runtime assets and do not need to be created manually.
+At startup the program opens the webcam and loads `finger_calibration.json` if
+it exists. It creates any missing chord WAV files in `sounds_v3` and downloads
+`hand_landmarker.task` beside the script if it is not already present. The
+audio files, calibration profile, and downloaded model are local runtime assets
+and do not need to be created manually.
 
 ## Keyboard controls
 
 | Key | Action |
 | --- | --- |
-| `Q` | Quit the application |
+| `C` | Start/cancel the calibration wizard |
+| `G` | Show/hide the gesture guide |
 | `D` | Toggle diagnostic information |
 | `R` | Reset gesture recognition history and the active chord |
 | `Space` | Replay the currently selected chord |
+| `Q` or `Esc` | Quit the application |
 
 ## How it works
 
@@ -110,16 +125,16 @@ runtime assets and do not need to be created manually.
    world landmarks.
 3. Hands are sorted by horizontal position: the screen-left hand controls the
    root and the screen-right hand controls the quality.
-4. Finger extension is estimated from landmark angles, relative distances, and
-   hysteresis thresholds that help prevent flickering between states.
-5. Recent finger counts are stored in short histories. A count is accepted only
-   after enough matching votes have accumulated.
-6. The root and quality are combined into a chord key.
-7. NumPy synthesizes each chord as several harmonically related sine waves with
-   staggered starts, an attack/decay envelope, normalization, and a short fade
-   out.
-8. The WAV file is played asynchronously with Windows audio playback while the
-   OpenCV interface continues rendering.
+4. Landmark positions are smoothed with One-Euro filters. Finger measurements
+   use landmark angles and relative distances, with probability smoothing and
+   hysteresis to prevent flickering.
+5. Recent gesture votes are accumulated. A template is accepted only after
+   enough matching frames in the short history.
+6. Calibration can replace the built-in finger templates with per-hand models
+   generated from six recorded poses.
+7. The root and quality are combined into one of 21 chord keys.
+8. The matching WAV file from `sounds_v3` is looped asynchronously with Windows
+   audio playback while the OpenCV interface continues rendering.
 
 ## Troubleshooting
 
@@ -128,11 +143,12 @@ runtime assets and do not need to be created manually.
 - **The hand model cannot be downloaded:** check the internet connection and
   try again. The model URL and local path are defined near the top of
   `HandChordAI.py`.
-- **Gestures are unstable:** improve lighting, keep both hands inside the
-  camera view, and hold the gesture still for a moment. The recognition
-  thresholds and vote history are configurable constants in the script.
+- **Gestures are unstable:** improve lighting, keep both hands 40–70 cm from
+  the camera without overlapping, and hold each pose still. Press `C` and
+  complete the calibration wizard for more accurate personal recognition.
 - **No sound is heard:** check Windows output volume and make sure the WAV
-  files are being generated in the `sounds` directory.
+  files exist in the `sounds_v3` directory. Missing files are regenerated
+  automatically at startup.
 - **Only one hand is detected:** move both hands farther apart and ensure
   fingers are visible without heavy occlusion.
 
