@@ -1,0 +1,7 @@
+# UPGRADE v3.1: the libraries HandChordAI needs.
+# Install them all at once with:
+#     python -m pip install -r requirements.txt
+# (The versions are the ones this project was tested with.)
+opencv-python>=4.8
+mediapipe>=0.10.14
+numpy>=1.24

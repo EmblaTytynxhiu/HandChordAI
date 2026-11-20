@@ -27,7 +27,28 @@ G       Show/hide the full gesture guide
 D       Toggle diagnostics (raw numbers for every finger)
 R       Reset gesture history
 SPACE   Replay the current chord
-Q/ESC   Quit
+M       Mute / unmute the sound                      (new in v3.1)
+S       Save a screenshot into the screenshots folder (new in v3.1)
+Q/ESC   Quit (closing the window with the X also works now)
+
+COMMAND-LINE OPTIONS (new in v3.1)
+----------------------------------
+    python HandChordAI.py                 normal start
+    python HandChordAI.py --camera 1      use the second webcam
+    python HandChordAI.py --mute          start with the sound off
+    python HandChordAI.py --help          show all options
+
+WHAT CHANGED IN v3.1  (search the code for "UPGRADE v3.1" to find each one)
+---------------------------------------------------------------------------
+1. FPS counter in the top-right corner of the camera view.
+2. Closing the window with the X button now really quits the program.
+3. One dropped camera frame no longer kills the program; it retries.
+4. The blurred camera background is computed on a tiny image -> faster.
+5. --camera and --mute command-line options (no more editing the code
+   just to switch webcams).
+6. M key = mute, S key = screenshot.
+7. Automatic tests live in tests/test_logic.py
+   (run them with:  python -m unittest discover tests)
 
 GESTURES
 --------
@@ -48,6 +69,7 @@ Calibration is saved in finger_calibration.json next to this file.
 from __future__ import annotations
 
 # ---- Standard library (comes with Python) ----
+import argparse             # UPGRADE v3.1: reads options like --camera 1 from the command line
 import json                 # read/write the calibration file
 import math                 # exp, log, sin, cos, pi ...
 import time                 # time.monotonic() = a clock that never goes backwards
@@ -134,6 +156,20 @@ SOUND_DIR = BASE_DIR / "sounds_v3"
 MODEL_PATH = BASE_DIR / "hand_landmarker.task"
 CALIBRATION_PATH = BASE_DIR / "finger_calibration.json"
 CALIBRATION_VERSION = 3   # bump this if the calibration format ever changes
+
+# ---- UPGRADE v3.1: new settings ----
+# Screenshots taken with the S key are saved in this folder.
+# (The folder is created automatically the first time you press S.)
+SCREENSHOT_DIR = BASE_DIR / "screenshots"
+
+# Webcams sometimes fail to deliver ONE frame (USB hiccup, driver busy).
+# Before v3.1 the program quit immediately when that happened. Now we
+# only give up after this many failed reads IN A ROW.
+CAMERA_READ_RETRIES = 30
+
+# How smooth the FPS number is. 0.1 means: each new frame changes the
+# displayed value by only 10%, so the number doesn't jump around wildly.
+FPS_SMOOTHING = 0.1
 
 # Official MediaPipe hand model (downloaded once, ~7 MB).
 MODEL_URL = (
@@ -1177,11 +1213,15 @@ def stop_chord():
         pass
 
 
-def play_chord(chord_name):
+def play_chord(chord_name, muted=False):
     """Start looping a chord's .wav in the background.
     SND_ASYNC = don't freeze the program while playing,
-    SND_LOOP  = repeat until stop_chord() is called."""
-    if winsound is None or chord_name not in CHORDS:
+    SND_LOOP  = repeat until stop_chord() is called.
+
+    UPGRADE v3.1: new 'muted' parameter. When muted is True we simply
+    don't start any sound. The rest of the program still thinks the chord
+    is "playing" (silently), so un-muting can restart it straight away."""
+    if muted or winsound is None or chord_name not in CHORDS:
         return
     path = SOUND_DIR / f"{chord_name}.wav"
     if not path.exists():
@@ -1584,7 +1624,10 @@ def draw_panel(display, state, now):
     draw_text(panel, "CALIBRATED" if calibrated else "NOT CALIBRATED - PRESS C",
               (360 if not calibrated else 500, 40), 0.38,
               SUCCESS if calibrated else GOLD, 1)
-    if state["playing_chord"]:
+    # UPGRADE v3.1: show "MUTED" (orange) when M was pressed / --mute was used.
+    if state["muted"]:
+        draw_text(panel, "MUTED (M)", (500, 70), 0.40, WARNING, 2)
+    elif state["playing_chord"]:
         draw_text(panel, "PLAYING", (500, 70), 0.40, SUCCESS, 2)
     else:
         draw_text(panel, "SOUND OFF", (500, 70), 0.38, MUTED)
@@ -1612,8 +1655,9 @@ def draw_panel(display, state, now):
                  tracks["QUALITY"].gesture)
 
     # ---- Footer ----
-    draw_text(panel, "C Calibrate | G Guide | D Debug | R Reset | SPACE Replay | Q Quit",
-              (18, 700), 0.33, MUTED)
+    # UPGRADE v3.1: added M (mute) and S (screenshot) to the key list.
+    draw_text(panel, "C Calib | G Guide | D Debug | R Reset | SPACE Replay | "
+              "M Mute | S Shot | Q Quit", (18, 700), 0.33, MUTED)
 
 
 def draw_guide_overlay(view):
@@ -1697,8 +1741,18 @@ def prepare_camera_view(frame):
     resized = cv2.resize(frame, (nw, nh))
 
     # Blurred background stretched to fill the whole left half.
-    canvas = cv2.GaussianBlur(cv2.resize(frame, (CAMERA_VIEW_WIDTH, DISPLAY_HEIGHT)),
-                              (51, 51), 0)
+    #
+    # UPGRADE v3.1 (speed): before, we blurred the FULL 640x720 image with
+    # a huge 51x51 blur EVERY frame - that's a lot of work for something
+    # that's supposed to look fuzzy anyway!
+    # Trick: shrink the image to 1/8 size (80x90), blur that with a small
+    # 7x7 blur, then stretch it back up. Stretching a tiny image makes it
+    # blurry for free, so the result looks the same but costs ~50x less.
+    small = cv2.resize(frame, (CAMERA_VIEW_WIDTH // 8, DISPLAY_HEIGHT // 8),
+                       interpolation=cv2.INTER_AREA)   # INTER_AREA = best for shrinking
+    small = cv2.GaussianBlur(small, (7, 7), 0)
+    canvas = cv2.resize(small, (CAMERA_VIEW_WIDTH, DISPLAY_HEIGHT),
+                        interpolation=cv2.INTER_LINEAR)  # LINEAR = smooth stretching
 
     # Paste the sharp image in the centre.
     x, y = (CAMERA_VIEW_WIDTH - nw) // 2, (DISPLAY_HEIGHT - nh) // 2
@@ -1726,6 +1780,15 @@ def compose_display(frame, state, now):
         elif state["debug"]:
             draw_debug(view, state["tracks"])
 
+        # UPGRADE v3.1: FPS counter (frames per second) in the top-right.
+        # The README always promised this but the code never drew it.
+        # Green = smooth (25+), orange = OK (15-25), red = slow (<15).
+        fps = state["fps"]
+        fps_color = SUCCESS if fps >= 25 else WARNING if fps >= 15 else DANGER
+        fps_text = f"{fps:.0f} FPS"
+        draw_text(view, fps_text, (CAMERA_VIEW_WIDTH - 20 - text_width(fps_text, 0.5, 2), 35),
+                  0.5, fps_color, 2)
+
     draw_panel(display, state, now)
     return display
 
@@ -1734,15 +1797,19 @@ def compose_display(frame, state, now):
 # 17. MAIN APPLICATION
 # ============================================================
 
-def open_camera():
+def open_camera(camera_index=CAMERA_INDEX):
     """Open the webcam. DirectShow (CAP_DSHOW) starts faster on Windows;
-    if it fails we try OpenCV's default backend."""
-    camera = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    if it fails we try OpenCV's default backend.
+
+    UPGRADE v3.1: camera_index is now a parameter, so --camera 1 on the
+    command line can choose a different webcam without editing the code."""
+    camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     if not camera.isOpened():
         camera.release()
-        camera = cv2.VideoCapture(CAMERA_INDEX)
+        camera = cv2.VideoCapture(camera_index)
     if not camera.isOpened():
-        raise RuntimeError("Could not open camera. Check CAMERA_INDEX.")
+        raise RuntimeError(f"Could not open camera {camera_index}. "
+                           "Try another one, e.g.: python HandChordAI.py --camera 1")
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
     camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # small buffer = less delay
@@ -1761,8 +1828,56 @@ def assign_roles(hands):
     return {}
 
 
-def run_application():
-    """Set everything up, then run the frame loop until you quit."""
+def save_screenshot(image):
+    """UPGRADE v3.1: save the current window image as a PNG (S key).
+
+    Files are named by date and time, e.g. screenshots/handchord_20261120_213015.png
+    so a new screenshot never overwrites an old one.
+    Returns the path on success, or None if saving failed."""
+    SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)   # create folder if needed
+    # time.strftime turns the current time into text: %Y=year %m=month %d=day,
+    # %H=hour %M=minute %S=second.
+    path = SCREENSHOT_DIR / f"handchord_{time.strftime('%Y%m%d_%H%M%S')}.png"
+    # cv2.imwrite returns True/False instead of raising an error.
+    return path if cv2.imwrite(str(path), image) else None
+
+
+def window_was_closed():
+    """UPGRADE v3.1: True if the user clicked the window's X button.
+
+    Without this check, clicking X just hides the window and the next
+    cv2.imshow() call opens it again - so the program never ends.
+    WND_PROP_VISIBLE is 1 while the window is open and 0 after it closes."""
+    try:
+        return cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        # Some OpenCV versions raise an error once the window is gone.
+        return True
+
+
+def parse_arguments():
+    """UPGRADE v3.1: read options typed after the script name.
+
+    Examples:
+        python HandChordAI.py --camera 1
+        python HandChordAI.py --mute
+    argparse also creates --help automatically from the help= texts."""
+    parser = argparse.ArgumentParser(
+        description="HandChordAI - play guitar chords with hand gestures.")
+    parser.add_argument("--camera", type=int, default=CAMERA_INDEX,
+                        help=f"webcam number (default {CAMERA_INDEX}; try 1 or 2 "
+                             "if you have more than one camera)")
+    parser.add_argument("--mute", action="store_true",
+                        help="start with the sound turned off (press M to unmute)")
+    return parser.parse_args()
+
+
+def run_application(camera_index=CAMERA_INDEX, start_muted=False):
+    """Set everything up, then run the frame loop until you quit.
+
+    UPGRADE v3.1: the two parameters come from the command line
+    (see parse_arguments). Calling run_application() with no arguments
+    still works exactly like before."""
 
     print("=" * 48)
     print("HANDCHORD AI - VIRTUAL GUITAR v3")
@@ -1783,11 +1898,13 @@ def run_application():
         "playing_chord": None,              # chord currently making sound
         "show_guide": False,                # G key
         "debug": False,                     # D key
+        "muted": start_muted,               # UPGRADE v3.1: M key / --mute
+        "fps": 0.0,                         # UPGRADE v3.1: smoothed frames per second
     }
     print("Personal calibration loaded." if state["profiles"]
           else "No calibration yet - press C in the window.")
 
-    camera = open_camera()
+    camera = open_camera(camera_index)
     detector = create_hand_detector()
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, DISPLAY_WIDTH, DISPLAY_HEIGHT)
@@ -1795,8 +1912,11 @@ def run_application():
     tracks = state["tracks"]
     last_timestamp = 0             # MediaPipe needs increasing timestamps
     last_valid_chord_time = 0.0    # when we last saw a full valid chord
+    failed_reads = 0               # UPGRADE v3.1: camera failures in a row
+    previous_frame_time = None     # UPGRADE v3.1: used to measure FPS
 
-    print("\nG = gesture guide | C = calibrate | D = debug | R = reset | Q = quit")
+    print("\nG = guide | C = calibrate | D = debug | R = reset | "
+          "M = mute | S = screenshot | Q = quit")
 
     # try/finally makes sure the camera is released even if something crashes.
     try:
@@ -1806,11 +1926,32 @@ def run_application():
             # ------------------------------------------------
             ok, frame = camera.read()
             if not ok or frame is None:
-                print("Could not read camera frame.")
-                break
+                # UPGRADE v3.1: don't quit on the first bad frame.
+                # Count failures in a row; only give up after many.
+                failed_reads += 1
+                if failed_reads >= CAMERA_READ_RETRIES:
+                    print("Camera stopped sending frames - closing.")
+                    break
+                # waitKey(10) pauses 10 ms (gives the camera time to
+                # recover) and keeps the window responsive meanwhile.
+                cv2.waitKey(10)
+                continue   # 'continue' = skip the rest and try again
+            failed_reads = 0   # got a good frame -> reset the counter
 
             frame = cv2.flip(frame, 1)   # 1 = flip horizontally (mirror)
             now = time.monotonic()
+
+            # UPGRADE v3.1: measure FPS.
+            # 1 / (seconds since the last frame) = frames per second.
+            # Then blend it into the old value so the number is steady.
+            if previous_frame_time is not None:
+                frame_seconds = max(now - previous_frame_time, 1e-6)  # never divide by 0
+                instant_fps = 1.0 / frame_seconds
+                if state["fps"] == 0.0:
+                    state["fps"] = instant_fps          # first measurement
+                else:
+                    state["fps"] += FPS_SMOOTHING * (instant_fps - state["fps"])
+            previous_frame_time = now
 
             # Timestamp in ms, forced to always go up by at least 1.
             timestamp = max(int(now * 1000), last_timestamp + 1)
@@ -1866,7 +2007,7 @@ def run_application():
                     # Only restart the sound if the chord CHANGED.
                     if state["playing_chord"] != chord:
                         stop_chord()
-                        play_chord(chord)
+                        play_chord(chord, state["muted"])   # v3.1: respects mute
                         state["playing_chord"] = chord
 
             # ------------------------------------------------
@@ -1893,7 +2034,10 @@ def run_application():
                 if tracks[role].visible:
                     draw_hand_landmarks(frame, tracks[role], role)
 
-            cv2.imshow(WINDOW_NAME, compose_display(frame, state, now))
+            # UPGRADE v3.1: keep the finished image in a variable so the
+            # S key can save exactly what you see on screen.
+            display = compose_display(frame, state, now)
+            cv2.imshow(WINDOW_NAME, display)
 
             # ------------------------------------------------
             # 7. Keyboard
@@ -1933,12 +2077,34 @@ def run_application():
             elif key == 32 and state["active_chord"] and not session["active"]:
                 # 32 = SPACE: replay the current chord from the start.
                 stop_chord()
-                play_chord(state["active_chord"])
+                play_chord(state["active_chord"], state["muted"])  # v3.1: respects mute
                 state["playing_chord"] = state["active_chord"]
                 last_valid_chord_time = now
 
+            elif char == "m":
+                # UPGRADE v3.1: M = mute / unmute.
+                state["muted"] = not state["muted"]
+                if state["muted"]:
+                    stop_chord()   # silence right now
+                    print("Sound muted.")
+                else:
+                    print("Sound on.")
+                    # If a chord is being held right now, start hearing it
+                    # immediately instead of waiting for the next chord change.
+                    if state["playing_chord"]:
+                        play_chord(state["playing_chord"])
+
+            elif char == "s":
+                # UPGRADE v3.1: S = save a screenshot of the whole window.
+                path = save_screenshot(display)
+                print(f"Screenshot saved: {path}" if path else "Screenshot failed.")
+
             elif char == "q" or key == 27:
                 # 27 = ESC
+                break
+
+            # UPGRADE v3.1: quit when the window's X button was clicked.
+            if window_was_closed():
                 break
 
     finally:
@@ -1957,7 +2123,9 @@ def run_application():
 # not when another file imports it.
 if __name__ == "__main__":
     try:
-        run_application()
+        # UPGRADE v3.1: read --camera / --mute and pass them on.
+        arguments = parse_arguments()
+        run_application(camera_index=arguments.camera, start_muted=arguments.mute)
     except KeyboardInterrupt:
         # Ctrl+C in the terminal = normal quit.
         print("\nApplication interrupted.")

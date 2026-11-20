@@ -85,7 +85,7 @@ Create and activate a virtual environment, then install the dependencies:
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install opencv-python numpy mediapipe
+python -m pip install -r requirements.txt
 ```
 
 If PowerShell blocks activation, run the script through the environment's
@@ -100,6 +100,14 @@ interpreter directly:
 ```powershell
 python HandChordAI.py
 ```
+
+Command-line options:
+
+| Option | Effect |
+| --- | --- |
+| `--camera N` | Use webcam number `N` (default `0`) |
+| `--mute` | Start with sound off (press `M` to turn it on) |
+| `--help` | List all options |
 
 At startup the program opens the webcam and loads `finger_calibration.json` if
 it exists. It creates any missing chord WAV files in `sounds_v3` and downloads
@@ -116,7 +124,18 @@ and do not need to be created manually.
 | `D` | Toggle diagnostic information |
 | `R` | Reset gesture recognition history and the active chord |
 | `Space` | Replay the currently selected chord |
-| `Q` or `Esc` | Quit the application |
+| `M` | Mute / unmute the sound |
+| `S` | Save a screenshot to the `screenshots` folder |
+| `Q`, `Esc`, or the window's X | Quit the application |
+
+## Tests
+
+The non-camera logic (chord table, gesture matching, voting, filtering,
+finger features) has automatic tests that use only built-in Python:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover tests
+```
 
 ## How it works
 
@@ -139,7 +158,7 @@ and do not need to be created manually.
 ## Troubleshooting
 
 - **The camera does not open:** check camera permissions, close other camera
-  applications, and verify that the configured `CAMERA_INDEX` is correct.
+  applications, and try another camera with `python HandChordAI.py --camera 1`.
 - **The hand model cannot be downloaded:** check the internet connection and
   try again. The model URL and local path are defined near the top of
   `HandChordAI.py`.
