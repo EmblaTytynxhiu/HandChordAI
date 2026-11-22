@@ -5,6 +5,7 @@ WHAT THIS PROGRAM DOES
 You hold both hands up in front of your webcam:
     - your LEFT hand (screen-left) picks the ROOT note  (C D E F G A B)
     - your RIGHT hand (screen-right) picks the QUALITY  (Major, Minor, 7th)
+      and, if its THUMB is out, makes the chord SHARP (#)   (new in v3.3)
 The program recognises which fingers are raised, works out the chord,
 shows how to play it on a guitar, and plays a strummed guitar sound.
 
@@ -43,6 +44,39 @@ COMMAND-LINE OPTIONS (new in v3.1, more in v3.2)
                                               rules (for comparing the two) (v3.2)
     python HandChordAI.py --help          show all options
 
+WHAT CHANGED IN v3.3  (search the code for "UPGRADE v3.3" to find each one)
+---------------------------------------------------------------------------
+SHARP (#) CHORDS - 21 chords became 36.
+1. The right (quality) hand's THUMB is no longer ignored. It is now the
+   "sharp switch":  thumb tucked = natural chord, thumb out = sharp chord.
+   Example: left "fist" (C) + right "index + thumb" = C# major.
+2. Only C D F G A can become sharp. E# and B# are not normal guitar
+   chords (E# sounds the same as F, B# the same as C), so on E and B the
+   thumb is simply ignored and you get the normal E / B chord.
+   -> 7 natural roots + 5 sharp roots = 12 roots x 3 qualities = 36 chords.
+3. The quality hand now has 6 gestures instead of 3: MAJOR, MINOR, 7TH
+   and #MAJOR, #MINOR, #7TH (the same three with the thumb out).
+   The chord's internal name is just root + quality gesture, so
+   "C" + "#MAJOR" = "C#MAJOR" (and its sound file is C#MAJOR.wav).
+   The helper chord_name() does this (and handles the E/B exception).
+4. New guitar shapes for the 15 sharp chords (FRET_SHAPES, CHORD_FINGERINGS).
+   The flat name is shown too, because guitarists often say Bb, not A#.
+5. Calibration has a 7th pose: "thumb + index out" (an L shape). It helps
+   the B root gesture AND the new sharp major gesture. Old calibration
+   files still load, but recalibrating (C) is recommended.
+6. The chord table on the panel always shows all 12 roots in piano order
+   (C, C#, D, D#, E, F, F#, G, G#, A, A#, B). Sharp rows are gold and say
+   e.g. "C + R thumb". The rows are shorter so all 12 fit.
+   (An earlier v3.3 draft only showed sharps while the thumb was out -
+   that hid them, so it was replaced.)
+7. The evaluation mode now asks for all 36 chords (about 3 minutes).
+8. Calibration sanity check (calibration_problems). BUG FOUND: the
+   calibration saved on 2026-11-22 20:21 never saw the thumbs "out", so
+   it couldn't tell thumb-in from thumb-out -> C/A and D/B got mixed up.
+   Now a calibration like that is refused (not saved, old one kept), and
+   an already-saved bad file is ignored at startup (built-in rules used,
+   with a message telling you to press C).
+
 WHAT CHANGED IN v3.2  (search the code for "UPGRADE v3.2" to find each one)
 ---------------------------------------------------------------------------
 EVALUATION MODE - so the thesis can report real numbers.
@@ -79,9 +113,9 @@ C  fist, thumb tucked          Major  index up
 D  index up                    Minor  index + middle up
 E  index + middle up           7th    index + middle + ring up
 F  index + middle + ring up
-G  all four fingers up         (the quality hand's thumb is ignored)
-A  thumb out only
-B  thumb + index up
+G  all four fingers up         Right THUMB OUT as well = SHARP (#)   (v3.3)
+A  thumb out only              e.g. D + "index + thumb" = D#
+B  thumb + index up            (E and B ignore the thumb: no E#/B#)
 
 Calibration is saved in finger_calibration.json next to this file.
 """
@@ -205,8 +239,9 @@ EVAL_DIR = BASE_DIR / "evaluation"
 #   record = time spent holding the chord. Accuracy is measured here.
 EVAL_SETTLE_SECONDS = 2.0
 EVAL_RECORD_SECONDS = 3.0
-# How many times each of the 21 chords is asked for in one session.
-# 1 -> 21 trials x 5 s = about 2 minutes. Change it with --eval-reps.
+# How many times each chord is asked for in one session.
+# UPGRADE v3.3: there are 36 chords now (was 21), so
+# 1 -> 36 trials x 5 s = about 3 minutes. Change it with --eval-reps.
 EVAL_REPETITIONS = 1
 
 # Official MediaPipe hand model (downloaded once, ~7 MB).
@@ -258,6 +293,29 @@ FINGER_NUMBER_COLORS = {1: SUCCESS, 2: BLUE, 3: GOLD, 4: (220, 130, 240)}
 ROOTS = ["C", "D", "E", "F", "G", "A", "B"]   # the 7 natural notes
 QUALITIES = ["MAJOR", "MINOR", "7TH"]          # the 3 chord types
 
+# ---- UPGRADE v3.3: sharp (#) chords ----
+# ROOTS above are still the 7 LEFT-HAND gestures. A sharp chord uses the
+# SAME left-hand gesture as its natural note (C# uses the C fist); the
+# right thumb is what adds the "#".
+#
+# Which natural notes can be made sharp. E and B are missing on purpose:
+# E# is the same sound as F and B# the same as C, and guitarists never
+# call them that - so on E and B the right thumb is simply ignored.
+SHARP_ROOTS = ["C", "D", "F", "G", "A"]
+
+# The sign written in front of a quality gesture name to mean "sharp".
+# "#MAJOR" = major WITH the right thumb out.
+SHARP_MARK = "#"
+
+# All 6 right-hand gestures: the 3 normal ones, then the 3 sharp ones.
+# -> ["MAJOR", "MINOR", "7TH", "#MAJOR", "#MINOR", "#7TH"]
+QUALITY_GESTURES = QUALITIES + [SHARP_MARK + q for q in QUALITIES]
+
+# Every sharp note also has a "flat" name (the same piano key).
+# Guitarists often prefer the flat name (Bb and Eb are much more common
+# than A# and D#), so we show it next to the sharp name.
+FLAT_NAMES = {"C#": "Db", "D#": "Eb", "F#": "Gb", "G#": "Ab", "A#": "Bb"}
+
 # How each quality is written after the root: C, Cm, C7.
 QUALITY_SUFFIX = {"MAJOR": "", "MINOR": "m", "7TH": "7"}
 # Long name shown under the big chord name: "C major", "C minor"...
@@ -293,6 +351,21 @@ FRET_SHAPES = {
     "G": {"MAJOR": "320003", "MINOR": "355333", "7TH": "320001"},
     "A": {"MAJOR": "x02220", "MINOR": "x02210", "7TH": "x02020"},
     "B": {"MAJOR": "x24442", "MINOR": "x24432", "7TH": "x21202"},
+    # ---- UPGRADE v3.3: the 15 sharp chords ----
+    # Sharps have (almost) no easy open-string shapes, so most of these are
+    # BARRE chords: the same shape as another chord, slid up the neck.
+    #   C#  = the A-shape barre at fret 4 (like Bb/A#, but 3 frets higher)
+    #   D#  = small 4-string shapes near the nut (same as Eb)
+    #   F#  = the F shape one fret higher (fret 2 instead of 1)
+    #   G#  = the F shape at fret 4
+    #   A#  = the A-shape barre at fret 1 (same as Bb)
+    # build_chords() checks every one of these really contains the right
+    # notes, so a typo here stops the program with a clear message.
+    "C#": {"MAJOR": "x46664", "MINOR": "x46654", "7TH": "x46464"},
+    "D#": {"MAJOR": "xx1343", "MINOR": "xx1342", "7TH": "xx1323"},
+    "F#": {"MAJOR": "244322", "MINOR": "244222", "7TH": "242322"},
+    "G#": {"MAJOR": "466544", "MINOR": "466444", "7TH": "464544"},
+    "A#": {"MAJOR": "x13331", "MINOR": "x13321", "7TH": "x13131"},
 }
 
 # Which finger of your FRETTING hand presses each string (same order).
@@ -315,6 +388,19 @@ CHORD_FINGERINGS = {
           "7TH": (None, 0, 1, 0, 2, 0)},
     "B": {"MAJOR": (None, 1, 3, 3, 3, 1), "MINOR": (None, 1, 3, 4, 2, 1),
           "7TH": (None, 2, 1, 3, 0, 4)},
+    # ---- UPGRADE v3.3: fingerings for the 15 sharp chords ----
+    # Same order as FRET_SHAPES above (low E string first).
+    # A "1" on two or more strings at the same fret = index-finger barre.
+    "C#": {"MAJOR": (None, 1, 2, 3, 4, 1), "MINOR": (None, 1, 3, 4, 2, 1),
+           "7TH": (None, 1, 3, 1, 4, 1)},
+    "D#": {"MAJOR": (None, None, 1, 3, 4, 2), "MINOR": (None, None, 1, 3, 4, 2),
+           "7TH": (None, None, 1, 3, 2, 4)},
+    "F#": {"MAJOR": (1, 3, 4, 2, 1, 1), "MINOR": (1, 3, 4, 1, 1, 1),
+           "7TH": (1, 3, 1, 2, 1, 1)},
+    "G#": {"MAJOR": (1, 3, 4, 2, 1, 1), "MINOR": (1, 3, 4, 1, 1, 1),
+           "7TH": (1, 3, 1, 2, 1, 1)},
+    "A#": {"MAJOR": (None, 1, 2, 3, 4, 1), "MINOR": (None, 1, 3, 4, 2, 1),
+           "7TH": (None, 1, 3, 1, 4, 1)},
 }
 
 
@@ -354,18 +440,68 @@ ROOT_DESCRIPTIONS = {
 ROOT_SHORT = {"C": "fist", "D": "index", "E": "2 fingers", "F": "3 fingers",
               "G": "4 fingers", "A": "thumb", "B": "thumb+index"}
 
-# Quality hand: None for the thumb means "don't care - up or down is fine".
+# Quality hand templates.
+# UPGRADE v3.3: before v3.3 the thumb was None here ("don't care"). Now the
+# thumb MEANS something: 0 = tucked = natural chord, 1 = out = sharp chord.
+# So there are 6 templates: the 3 old ones with the thumb tucked, and the
+# same 3 with the thumb out (their names start with "#").
 QUALITY_TEMPLATES = {
-    "MAJOR": (None, 1, 0, 0, 0),
-    "MINOR": (None, 1, 1, 0, 0),
-    "7TH": (None, 1, 1, 1, 0),
+    "MAJOR": (0, 1, 0, 0, 0),
+    "MINOR": (0, 1, 1, 0, 0),
+    "7TH": (0, 1, 1, 1, 0),
+    "#MAJOR": (1, 1, 0, 0, 0),    # UPGRADE v3.3: index + thumb  (an "L")
+    "#MINOR": (1, 1, 1, 0, 0),    # UPGRADE v3.3: index + middle + thumb
+    "#7TH": (1, 1, 1, 1, 0),      # UPGRADE v3.3: index + middle + ring + thumb
 }
 
 QUALITY_DESCRIPTIONS = {
     "MAJOR": "Index up",
     "MINOR": "Index + middle",
     "7TH": "Index + middle + ring",
+    # UPGRADE v3.3: the sharp versions.
+    "#MAJOR": "Index + thumb",
+    "#MINOR": "Index + middle + thumb",
+    "#7TH": "Index + middle + ring + thumb",
 }
+
+
+# ---- UPGRADE v3.3: small helpers for the sharp gestures ----
+
+def is_sharp_gesture(quality_gesture):
+    """True if this right-hand gesture has the thumb out (= sharp).
+    "#MINOR" -> True, "MINOR" -> False, None (unclear hand) -> False."""
+    return bool(quality_gesture) and quality_gesture.startswith(SHARP_MARK)
+
+
+def base_quality(quality_gesture):
+    """Remove the "#" to get the plain chord type: "#MINOR" -> "MINOR".
+    (Used to know which column of the chord table to highlight.)"""
+    if quality_gesture is None:
+        return None
+    return quality_gesture.lstrip(SHARP_MARK)
+
+
+def quality_label(quality_gesture):
+    """Nice text for a right-hand gesture: "#7TH" -> "# 7th", "MINOR" -> "Minor"."""
+    words = {"MAJOR": "Major", "MINOR": "Minor", "7TH": "7th"}
+    sharp = "# " if is_sharp_gesture(quality_gesture) else ""
+    return sharp + words[base_quality(quality_gesture)]
+
+
+def chord_name(root_gesture, quality_gesture):
+    """Combine the two hands' gestures into the chord's internal name.
+
+        "C" + "MAJOR"   -> "CMAJOR"     (normal chord, like before v3.3)
+        "C" + "#MAJOR"  -> "C#MAJOR"    (thumb out -> C sharp major)
+        "E" + "#MINOR"  -> "EMINOR"     (no E#: the thumb is ignored on E and B)
+
+    The result is always a key of CHORDS and the name of its .wav file."""
+    if is_sharp_gesture(quality_gesture) and root_gesture not in SHARP_ROOTS:
+        # E or B with the thumb out: drop the "#" and play the normal chord.
+        return root_gesture + base_quality(quality_gesture)
+    # Otherwise just glue them together. The "#" (if any) lands right after
+    # the root letter, which is exactly how sharp chords are written.
+    return root_gesture + quality_gesture
 
 
 # ============================================================
@@ -395,7 +531,7 @@ HAND_CONNECTIONS = [
 
 
 # ============================================================
-# 6. BUILD AND VALIDATE THE 21 CHORDS
+# 6. BUILD AND VALIDATE THE 36 CHORDS  (UPGRADE v3.3: was 21)
 # ============================================================
 
 def midi_to_frequency(midi):
@@ -405,7 +541,8 @@ def midi_to_frequency(midi):
 
 
 def build_chords():
-    """Create a dictionary with everything we know about all 21 chords.
+    """Create a dictionary with everything we know about all 36 chords
+    (UPGRADE v3.3: was 21 - the 15 sharp chords were added).
 
     It also double-checks the tables above: every note in a guitar shape
     must belong to the chord, and the root note must be in it. If you
@@ -414,10 +551,19 @@ def build_chords():
 
     chords = {}
 
-    for root in ROOTS:
+    # UPGRADE v3.3: build a list of (gesture_root, sharp) pairs first:
+    #   the 7 natural roots  -> ("C", False), ("D", False) ... ("B", False)
+    #   the 5 sharp roots    -> ("C", True),  ("D", True)  ... ("A", True)
+    # gesture_root is the LEFT-hand gesture; sharp says if the right thumb is out.
+    root_variants = [(r, False) for r in ROOTS] + [(r, True) for r in SHARP_ROOTS]
+
+    for gesture_root, sharp in root_variants:
+        # UPGRADE v3.3: the note the chord is built on, e.g. "C" or "C#".
+        root = gesture_root + (SHARP_MARK if sharp else "")
         for quality in QUALITIES:
             # Pitch classes = note numbers 0..11 (C=0, C#=1, ... B=11).
-            root_pc = ROOT_SEMITONES[root]
+            # UPGRADE v3.3: a sharp is one semitone (one piano key) higher.
+            root_pc = (ROOT_SEMITONES[gesture_root] + (1 if sharp else 0)) % 12
             pitch_classes = [(root_pc + i) % 12 for i in CHORD_INTERVALS[quality]]
 
             fret = FRET_SHAPES[root][quality]
@@ -441,13 +587,31 @@ def build_chords():
             if not voiced <= set(pitch_classes) or root_pc not in voiced:
                 raise ValueError(f"Voicing {fret} does not match {root}{quality}")
 
-            # Internal name, e.g. "AMINOR". Display name is "Am".
-            name = root + quality
+            # UPGRADE v3.3: the right-hand gesture that picks this chord,
+            # e.g. "MINOR" for Am, "#MINOR" for A#m.
+            quality_gesture = (SHARP_MARK if sharp else "") + quality
+
+            # Long name, e.g. "A minor". UPGRADE v3.3: sharp chords also get
+            # their flat name, e.g. "A# minor (= Bbm)".
+            long_name = f"{root} {QUALITY_WORD[quality]}"
+            if sharp:
+                long_name += f"  (= {FLAT_NAMES[root]}{QUALITY_SUFFIX[quality]})"
+
+            # Internal name, e.g. "AMINOR" or "A#MINOR". Display name is "Am".
+            # UPGRADE v3.3: chord_name() makes the SAME name from the two
+            # gestures, so the main loop can find this chord in the table.
+            name = chord_name(gesture_root, quality_gesture)
             chords[name] = {
-                "root": root,
-                "quality": quality,
-                "display": root + QUALITY_SUFFIX[quality],     # "Am"
-                "long_name": f"{root} {QUALITY_WORD[quality]}",  # "A minor"
+                # "root" is the LEFT-hand gesture letter ("C" for both C and C#).
+                # The drawing code uses it to look up ROOT_TEMPLATES, and the
+                # evaluation logs it as the target for the left hand.
+                "root": gesture_root,
+                "root_note": root,                   # UPGRADE v3.3: "C" or "C#"
+                "sharp": sharp,                      # UPGRADE v3.3: True for C#, D# ...
+                "quality": quality,                  # chord type: MAJOR/MINOR/7TH
+                "quality_gesture": quality_gesture,  # UPGRADE v3.3: right-hand gesture
+                "display": root + QUALITY_SUFFIX[quality],     # "Am" / "A#m"
+                "long_name": long_name,                        # "A minor"
                 "notes": [NOTE_NAMES[pc] for pc in pitch_classes],  # ["A","C","E"]
                 "fret": fret,
                 "fingers": fingers,
@@ -457,9 +621,11 @@ def build_chords():
                 ],
             }
 
-    # 7 roots x 3 qualities = 21.
-    if len(chords) != 21:
-        raise ValueError(f"Expected 21 chords, got {len(chords)}")
+    # UPGRADE v3.3: (7 natural + 5 sharp roots) x 3 qualities = 36 (was 21).
+    # Calculated instead of typed, so it stays right if the lists change.
+    expected = (len(ROOTS) + len(SHARP_ROOTS)) * len(QUALITIES)
+    if len(chords) != expected:
+        raise ValueError(f"Expected {expected} chords, got {len(chords)}")
     return chords
 
 
@@ -1015,13 +1181,20 @@ CALIBRATION_POSES = [
     ("THREE", "Index + middle + ring up, thumb holds the pinky", (0, 1, 1, 1, 0)),
     ("OPEN", "Open hands, spread all five fingers", (1, 1, 1, 1, 1)),
     ("THUMB", "Thumbs out to the side, other fingers folded", (1, 0, 0, 0, 0)),
+    # UPGRADE v3.3: 7th pose. "Thumb + index" is the B root gesture AND the
+    # new sharp-major gesture, but no pose recorded exactly that before.
+    # Recording it teaches the thumb model what "thumb out while the index
+    # is up" looks like, which is the hardest case for the sharp switch.
+    # (Adding a pose doesn't change the file format: old calibration files
+    # still load fine, they just didn't see this pose.)
+    ("L", "Thumb + index out (an L shape), others folded", (1, 1, 0, 0, 0)),
 ]
 
 
 def create_calibration_session():
     """A dictionary holding the calibration wizard's progress.
         active      = is calibration running?
-        phase       = which pose we're on (0..5)
+        phase       = which pose we're on (0..6 - UPGRADE v3.3: 7 poses now)
         phase_start = when this pose started
         samples     = frames recorded for the current pose
         collected   = all (pattern, frame) pairs from finished poses
@@ -1044,6 +1217,46 @@ def cancel_calibration(session):
                     "notice": "Calibration cancelled."})
 
 
+# ---- UPGRADE v3.3: calibration sanity check ----
+# WHY? On 2026-11-22 a calibration was saved where the thumbs were never
+# really seen "out" during the OPEN / THUMB poses (maybe the thumb pointed
+# at the camera, or the pose was rushed). The program trained on that
+# without complaining, and afterwards it kept mixing up C/A and D/B
+# (the gestures that differ ONLY by the thumb).
+#
+# The check: for every finger, compare the typical "up" value with the
+# typical "folded" value of its MAIN measurement. If they're almost the
+# same, the model can't tell up from folded -> refuse the calibration.
+#   thumb  -> feature 0 "across": out to the side ~ -0.8, tucked ~ +0.6
+#             (a good calibration has a gap of about 1.3-1.4)
+#   others -> feature 0 "flex":   straight ~ 20 deg, curled ~ 200 deg
+#             (a good calibration has a gap of 110+ degrees)
+# The broken file had a thumb gap of only 0.15-0.19.
+MIN_THUMB_ACROSS_GAP = 0.5     # palm widths
+MIN_FINGER_FLEX_GAP = 60.0     # degrees
+
+
+def calibration_problems(profiles):
+    """Return a list of fingers whose calibration can't tell up from folded.
+    Empty list = the calibration looks fine.
+
+    profiles = {"ROOT": {finger: model}, "QUALITY": {...}} as made by
+    train_profiles() or loaded from finger_calibration.json."""
+    hand_names = {"ROOT": "left", "QUALITY": "right"}
+    problems = []
+    for role in ROLE_NAMES:
+        for finger in FINGER_NAMES:
+            model = profiles[role][finger]
+            # closed minus open on feature 0. Positive and big = good:
+            # a tucked thumb sits further "across" the palm, and a folded
+            # finger is far more bent, than when they're up.
+            gap = model["closed"]["mean"][0] - model["open"]["mean"][0]
+            needed = MIN_THUMB_ACROSS_GAP if finger == "THUMB" else MIN_FINGER_FLEX_GAP
+            if gap < needed:
+                problems.append(f"{hand_names[role]} {finger}")
+    return problems
+
+
 def train_profiles(collected):
     """Train the models for both hands from all recorded frames.
 
@@ -1059,6 +1272,14 @@ def train_profiles(collected):
             # Was this finger supposed to be up in that frame's pose?
             y = [pattern[finger_index] == 1 for pattern, _ in collected]
             profiles[role][finger] = train_finger_model(X, y, finger)
+
+    # UPGRADE v3.3: refuse a calibration that can't tell up from folded.
+    # Raising ValueError is enough: update_calibration() already catches it,
+    # shows "Calibration failed: ..." on screen and does NOT save the file
+    # (so your previous calibration is kept).
+    problems = calibration_problems(profiles)
+    if problems:
+        raise ValueError(f"{', '.join(problems)} not seen up AND folded - redo (C)")
     return profiles
 
 
@@ -1159,6 +1380,14 @@ def load_calibration():
                     entry = roles[role][finger][label]
                     if len(entry["mean"]) != 4 or len(entry["std"]) != 4:
                         raise ValueError(f"Bad entry {role}/{finger}/{label}")
+
+        # UPGRADE v3.3: a file saved BEFORE the sanity check existed may be
+        # broken (like the one from 2026-11-22). Don't use it - the built-in
+        # rules are better than a calibration that has the thumb wrong.
+        problems = calibration_problems(roles)
+        if problems:
+            raise ValueError(f"it can't tell up from folded for: {', '.join(problems)}. "
+                             "Using built-in rules - please recalibrate (press C)")
         return roles
     except (OSError, ValueError, KeyError, TypeError) as error:
         # json.JSONDecodeError is a subclass of ValueError, so it's caught too.
@@ -1177,7 +1406,7 @@ def load_calibration():
 #   system recognised on every single frame.
 #
 # HOW A SESSION WORKS
-#   1. Press E. The 21 chords are shuffled into a random order.
+#   1. Press E. All chords (36 since v3.3) are shuffled into a random order.
 #   2. For each chord ("trial"): the target is shown on the panel.
 #        - first EVAL_SETTLE_SECONDS: change your hands to the new chord
 #        - then  EVAL_RECORD_SECONDS: hold it still
@@ -1231,7 +1460,7 @@ def evaluation_columns():
 
 
 def make_trial_order(repetitions, rng):
-    """Shuffle the 21 chords into the order the user is asked for them.
+    """Shuffle all chords (36 since UPGRADE v3.3) into the order the user is asked for them.
 
     repetitions = how many times each chord appears.
     rng         = a random.Random object (seeded, so the order can be
@@ -1241,7 +1470,7 @@ def make_trial_order(repetitions, rng):
     latency measurement: if the chord didn't change, it would already be
     "recognised" at time 0 and the measured time would be meaningless.
     """
-    chords = list(CHORDS)          # the 21 internal names, e.g. "EMINOR"
+    chords = list(CHORDS)          # all internal names, e.g. "EMINOR", "C#MAJOR"
     order = []
     for _ in range(repetitions):
         block = chords[:]          # [:] = a copy, so shuffling doesn't touch 'chords'
@@ -1363,8 +1592,13 @@ def evaluation_row(session, state, now):
         "live_classifier": meta["live_classifier"],
         "trial": trial_number,
         "target": target,
+        # The GESTURE each hand should make, so the analysis can compare it
+        # directly with what was recognised (root_stable, quality_stable ...).
         "target_root": CHORDS[target]["root"],
-        "target_quality": CHORDS[target]["quality"],
+        # UPGRADE v3.3: log the right-hand GESTURE ("#MINOR" for A#m), not
+        # just the chord type ("MINOR"), otherwise every correctly made
+        # sharp chord would be counted as a quality-hand error.
+        "target_quality": CHORDS[target]["quality_gesture"],
         "phase": "settle" if t_trial < EVAL_SETTLE_SECONDS else "record",
         "t_trial": round(t_trial, 4),
         "t_session": round(now - session["session_start"], 4),
@@ -1509,9 +1743,11 @@ def generate_chord(chord, filename):
 
 
 def create_chord_files():
-    """Generate any of the 21 chord .wav files that don't exist yet."""
+    """Generate any of the chord .wav files that don't exist yet.
+    UPGRADE v3.3: the 15 new sharp chords (C#MAJOR.wav ...) are created
+    automatically the first time v3.3 runs; the old 21 files are reused."""
     SOUND_DIR.mkdir(parents=True, exist_ok=True)
-    print("Preparing 21 guitar chord sounds...")
+    print(f"Preparing {len(CHORDS)} guitar chord sounds...")
     for name, chord in CHORDS.items():
         path = SOUND_DIR / f"{name}.wav"
         if not path.exists():
@@ -1829,7 +2065,7 @@ def draw_calibration_card(panel, session, now):
     cv2.rectangle(panel, (35, 210), (600, 228), BORDER, -1)
     cv2.rectangle(panel, (35, 210), (35 + int(565 * progress), 228), SUCCESS, -1)
 
-    # Thin bar = overall progress through all 6 poses.
+    # Thin bar = overall progress through all the poses (7 since v3.3).
     overall = (phase + progress) / len(CALIBRATION_POSES)
     cv2.rectangle(panel, (35, 236), (600, 240), BORDER, -1)
     cv2.rectangle(panel, (35, 236), (35 + int(565 * overall), 240), MINT, -1)
@@ -1860,8 +2096,10 @@ def draw_evaluation_card(panel, session, active_chord, now):
     draw_mini_hand(panel, 190, 210, ROOT_TEMPLATES[target["root"]], mirrored=True,
                    size=1.2, highlight=True)
     draw_text(panel, "+", (248, 200), 0.5, MUTED)
-    draw_mini_hand(panel, 266, 210, QUALITY_TEMPLATES[target["quality"]], mirrored=False,
-                   size=1.2, highlight=True)
+    # UPGRADE v3.3: use the right-hand GESTURE (e.g. "#MINOR"), so the icon
+    # shows the thumb out when a sharp chord is asked for.
+    draw_mini_hand(panel, 266, 210, QUALITY_TEMPLATES[target["quality_gesture"]],
+                   mirrored=False, size=1.2, highlight=True)
 
     # What the system recognises right now (only the voted, stable result).
     draw_text(panel, "Recognised:", (360, 160), 0.42, MUTED)
@@ -1913,63 +2151,121 @@ def draw_chord_card(panel, active_chord, notice):
     # "Left hand icon + right hand icon" = how to make this chord.
     draw_mini_hand(panel, 190, 190, ROOT_TEMPLATES[chord["root"]], mirrored=True)
     draw_text(panel, "+", (238, 182), 0.5, MUTED)
-    draw_mini_hand(panel, 254, 190, QUALITY_TEMPLATES[chord["quality"]], mirrored=False)
+    # UPGRADE v3.3: "quality_gesture" (not "quality") so sharp chords show
+    # the right-hand icon WITH the thumb out.
+    draw_mini_hand(panel, 254, 190, QUALITY_TEMPLATES[chord["quality_gesture"]],
+                   mirrored=False)
 
     draw_fretboard(panel, chord)
 
 
 def draw_library(panel, active_chord, root_gesture, quality_gesture):
-    """The 7x3 chord table, which doubles as a gesture guide:
+    """The chord table, which doubles as a gesture guide:
     each row shows the left-hand gesture, each column the right-hand one.
-    The currently detected row/column/chord are highlighted."""
+    The currently detected row/column/chord are highlighted.
 
-    draw_text(panel, "GESTURE GUIDE", (22, 400), 0.50, TEXT, 2)
-    draw_text(panel, "left hand picks the row, right hand picks the column",
-              (190, 400), 0.34, MUTED)
+    UPGRADE v3.3 (second version): ALL 12 roots are always shown, in piano
+    order: C, C#, D, D#, E, F, F#, G, G#, A, A#, B  (= 36 chords).
+    (The first v3.3 version only showed the sharps while your thumb was
+    out - that hid them, so it was replaced.)
+    To make 12 rows fit in the same space, the rows are a bit shorter
+    (19 px instead of 30) and the icons/text a bit smaller.
+    A sharp row uses the SAME left-hand gesture as the natural row above
+    it, so instead of repeating the icon it says e.g. "C + R thumb"."""
+
+    # UPGRADE v3.3: the 12 rows as (left-hand gesture, is_sharp) pairs.
+    # For each natural root we add its row, then (if it has one) its sharp:
+    #   ("C", False), ("C", True), ("D", False), ("D", True), ("E", False) ...
+    rows = []
+    for root in ROOTS:
+        rows.append((root, False))
+        if root in SHARP_ROOTS:
+            rows.append((root, True))
+
+    # UPGRADE v3.3: which row is "live" right now, e.g. ("C", True) for C#.
+    # The sharp only counts on roots that have one (E/B ignore the thumb),
+    # exactly like chord_name() does in the main loop.
+    current_row = None
+    if root_gesture is not None:
+        current_row = (root_gesture,
+                       is_sharp_gesture(quality_gesture) and root_gesture in SHARP_ROOTS)
+
+    draw_text(panel, "GESTURE GUIDE", (22, 398), 0.50, TEXT, 2)
+    draw_text(panel, "rows = left hand, columns = right | right thumb out = #",
+              (190, 398), 0.32, MUTED)
 
     # Layout numbers (pixels inside the panel).
+    # UPGRADE v3.3: smaller rows/header and the table starts a bit higher,
+    # so 12 rows end at about y=683 - just above the footer text at y=700.
     left, root_w, gap = 18, 150, 6
-    top, row_h, header_h = 410, 30, 36
+    top, row_h, row_gap, header_h = 404, 19, 2, 26
     cell_w = (622 - left - root_w - 3 * gap) // 3
 
     # ---- Column headers: quality gesture icons ----
     for col, quality in enumerate(QUALITIES):
         x1 = left + root_w + gap + col * (cell_w + gap)
-        is_current = quality == quality_gesture
+        # UPGRADE v3.3: base_quality() removes the "#", so the Minor column
+        # lights up for both "MINOR" and "#MINOR".
+        is_current = quality == base_quality(quality_gesture)
         cv2.rectangle(panel, (x1, top), (x1 + cell_w, top + header_h),
                       ACTIVE if is_current else CARD, -1)
-        draw_mini_hand(panel, x1 + 8, top + header_h - 5,
-                       QUALITY_TEMPLATES[quality], mirrored=False, size=0.85,
+        # Icon = the natural gesture (thumb tucked). The hint text above the
+        # table says that adding the thumb makes it sharp.
+        draw_mini_hand(panel, x1 + 8, top + header_h - 3,
+                       QUALITY_TEMPLATES[quality], mirrored=False, size=0.7,
                        highlight=is_current)
         draw_text(panel, quality.title() if quality != "7TH" else "7th",
-                  (x1 + 52, top + 23), 0.42, TEXT)
+                  (x1 + 48, top + 18), 0.40, TEXT)
 
-    draw_text(panel, "ROOT", (left + 8, top + 23), 0.40, BLUE)
+    draw_text(panel, "ROOT", (left + 8, top + 18), 0.40, BLUE)
 
-    # ---- One row per root note ----
-    for row, root in enumerate(ROOTS):
-        y1 = top + header_h + 4 + row * (row_h + 2)
+    # ---- One row per root note (12 rows) ----
+    for row, (root, sharp) in enumerate(rows):
+        y1 = top + header_h + 3 + row * (row_h + row_gap)
         y2 = y1 + row_h
-        is_current = root == root_gesture
+        is_current = (root, sharp) == current_row
+        label = root + (SHARP_MARK if sharp else "")     # "C" or "C#"
 
-        # Left cell: letter + hand icon + short description.
+        # Left cell: note name + how to make it.
         cv2.rectangle(panel, (left, y1), (left + root_w, y2),
                       ACTIVE if is_current else CARD, -1)
-        draw_text(panel, root, (left + 8, y1 + 22), 0.6, MINT, 2)
-        draw_mini_hand(panel, left + 34, y2 - 4, ROOT_TEMPLATES[root],
-                       mirrored=True, size=0.8, highlight=is_current)
-        draw_text(panel, ROOT_SHORT[root], (left + 76, y1 + 19), 0.34, MUTED)
+        # Sharp rows are written in GOLD so they stand out from the naturals.
+        draw_text(panel, label, (left + 6, y1 + 15), 0.45, GOLD if sharp else MINT, 1)
+        # UPGRADE v3.3: EVERY row (natural and sharp) now has the same layout:
+        #   [note]  [left-hand icon]  [right-thumb icon if sharp]  [description]
+        # (Before, sharp rows only had the text "C + R thumb" and no picture.)
+
+        # 1) Left-hand icon. A sharp row uses the SAME left-hand gesture as
+        #    its natural note (C# = the C fist), so it's the same icon.
+        draw_mini_hand(panel, left + 36, y2 - 2, ROOT_TEMPLATES[root],
+                       mirrored=True, size=0.55, highlight=is_current)
+
+        # 2) Sharp rows only: a small RIGHT-hand icon with just the thumb up
+        #    (the other fingers are drawn as outlines = "whatever the column
+        #    says"). Slightly bigger than the left icon, and with a grey palm
+        #    (highlight=False) so the orange thumb stands out clearly.
+        if sharp:
+            thumb_only = (1, None, None, None, None)   # (T, I, M, R, P)
+            draw_mini_hand(panel, left + 54, y2 - 2, thumb_only,
+                           mirrored=False, size=0.7, highlight=False)
+
+        # 3) Short description, at the same x for every row so they line up.
+        #    Gold on sharp rows to match the gold "#" note name.
+        draw_text(panel, ROOT_SHORT[root], (left + 84, y1 + 14), 0.32,
+                  GOLD if sharp else MUTED)
 
         # Three chord cells: name + guitar shape.
         for col, quality in enumerate(QUALITIES):
             x1 = left + root_w + gap + col * (cell_w + gap)
-            name = root + quality
+            # UPGRADE v3.3: chord_name() gives the same name the main loop
+            # uses, e.g. ("C", "#MINOR") -> "C#MINOR".
+            name = chord_name(root, (SHARP_MARK if sharp else "") + quality)
             color = ACTIVE if name == active_chord else CARD
             cv2.rectangle(panel, (x1, y1), (x1 + cell_w, y2), color, -1)
             cv2.rectangle(panel, (x1, y1), (x1 + cell_w, y2), BORDER, 1)
-            draw_text(panel, CHORDS[name]["display"], (x1 + 10, y1 + 21), 0.48,
+            draw_text(panel, CHORDS[name]["display"], (x1 + 8, y1 + 15), 0.42,
                       MINT if name == active_chord else TEXT, 1)
-            draw_text(panel, CHORDS[name]["fret"].upper(), (x1 + 62, y1 + 20), 0.33, MUTED)
+            draw_text(panel, CHORDS[name]["fret"].upper(), (x1 + 66, y1 + 14), 0.30, MUTED)
 
 
 def draw_panel(display, state, now):
@@ -2023,8 +2319,9 @@ def draw_panel(display, state, now):
     tracks = state["tracks"]
     draw_hand_status(panel, 22, "LEFT HAND: ROOT", tracks["ROOT"], BLUE, True,
                      lambda g: g)
+    # UPGRADE v3.3: quality_label() also knows the sharp gestures ("# Minor").
     draw_hand_status(panel, 330, "RIGHT HAND: QUALITY", tracks["QUALITY"], GOLD, False,
-                     lambda g: {"MAJOR": "Major", "MINOR": "Minor", "7TH": "7th"}[g])
+                     quality_label)
 
     # ---- Chord table / gesture guide ----
     draw_library(panel, state["active_chord"], tracks["ROOT"].gesture,
@@ -2066,15 +2363,24 @@ def draw_guide_overlay(view):
         label = {"MAJOR": "Major", "MINOR": "Minor", "7TH": "7th"}[quality]
         draw_text(view, label, (452, y - 8), 0.55, TEXT, 2)
         draw_text(view, QUALITY_DESCRIPTIONS[quality], (452, y + 10), 0.38, MUTED)
-    draw_text(view, "Thumb doesn't matter here", (366, 300), 0.38, MUTED)
+    # UPGRADE v3.3: the right thumb used to "not matter". Now it is the
+    # sharp switch, so explain it with an icon (index + thumb = # Major).
+    draw_text(view, "Keep the thumb TUCKED for these.", (366, 296), 0.38, MUTED)
+    draw_text(view, "SHARP (#): add the THUMB", (366, 330), 0.5, GOLD, 2)
+    draw_mini_hand(view, 366, 380, QUALITY_TEMPLATES["#MAJOR"], mirrored=False, size=1.4)
+    draw_text(view, "e.g. index + thumb", (452, 356), 0.40, TEXT)
+    draw_text(view, "= # Major", (452, 376), 0.40, TEXT)
+    draw_text(view, "E and B have no #: thumb ignored", (366, 404), 0.36, MUTED)
 
-    draw_text(view, "Example: left 'index + middle' (E)", (366, 350), 0.40, TEXT)
-    draw_text(view, "+ right 'index + middle' (Minor) = Em", (366, 372), 0.40, TEXT)
+    draw_text(view, "Example: left 'index + middle' (E)", (366, 436), 0.40, TEXT)
+    draw_text(view, "+ right 'index + middle' (Minor) = Em", (366, 456), 0.40, TEXT)
+    draw_text(view, "Left fist (C) + right index + thumb = C#", (366, 478), 0.38, GOLD)
 
     # ---- Tips ----
     tips = [
         "TIPS FOR RELIABLE TRACKING",
-        "- Press C once and do the 6 calibration poses.",
+        # UPGRADE v3.3: the number of poses is counted, not typed (now 7).
+        f"- Press C once and do the {len(CALIBRATION_POSES)} calibration poses.",
         "- Palms facing the camera, hands 40-70 cm away.",
         "- Keep the hands apart; don't let them overlap.",
         "- Light from the front, not a bright window behind you.",
@@ -2281,7 +2587,7 @@ def run_application(camera_index=CAMERA_INDEX, start_muted=False,
     UPGRADE v3.2: added participant, eval_reps and force_fallback."""
 
     print("=" * 48)
-    print("HANDCHORD AI - VIRTUAL GUITAR v3")
+    print("HANDCHORD AI - VIRTUAL GUITAR v3.3")   # UPGRADE v3.3: version number
     print("=" * 48)
     if winsound is None:
         print("WARNING: winsound is unavailable; audio playback is disabled.")
@@ -2407,7 +2713,10 @@ def run_application(camera_index=CAMERA_INDEX, start_muted=False,
                 quality = tracks["QUALITY"].vote(QUALITY_TEMPLATES)
 
                 if root is not None and quality is not None:
-                    chord = root + quality           # e.g. "E" + "MINOR"
+                    # UPGRADE v3.3: chord_name() instead of root + quality.
+                    # "E" + "MINOR" -> "EMINOR" like before, "C" + "#MAJOR" ->
+                    # "C#MAJOR", and "E" + "#MINOR" -> "EMINOR" (no E#).
+                    chord = chord_name(root, quality)
                     state["active_chord"] = chord
                     last_valid_chord_time = now
 

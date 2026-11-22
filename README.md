@@ -13,10 +13,12 @@ OpenCV, MediaPipe, NumPy, and Python's built-in audio/file modules.
 - Real-time webcam hand tracking for up to two hands.
 - Left-hand gesture selection for seven roots: C, D, E, F, G, A, or B.
 - Right-hand gesture selection for major, minor, or dominant seventh quality.
-- 21 supported chords: seven roots multiplied by three qualities.
+- Right-hand thumb as a sharp (#) switch for C#, D#, F#, G#, and A#.
+- 36 supported chords: twelve roots (7 natural + 5 sharp) multiplied by three
+  qualities.
 - Pre-generated strummed-style WAV audio stored in `sounds_v3`, with missing
   files generated automatically at startup.
-- A six-pose personal calibration wizard that improves finger recognition for
+- A seven-pose personal calibration wizard that improves finger recognition for
   each hand and saves its profiles in `finger_calibration.json`.
 - One-Euro filtering and temporal smoothing for steadier hand and finger
   tracking.
@@ -45,12 +47,17 @@ The application assigns hands by their position on the mirrored camera image:
 | Right / quality | Index up | Major |
 | Right / quality | Index and middle up | Minor |
 | Right / quality | Index, middle, and ring up | Dominant 7th |
+| Right / quality | Any of the above **plus thumb out** | Sharp (#) version |
 
 Hold both gestures steadily until the interface recognizes them. The selected
 chord starts looping when it becomes active and restarts only when the chord
 changes.
 
-The thumb on the right/quality hand is ignored. Press `C` to start or cancel
+The thumb on the right/quality hand is the sharp switch: keep it tucked for
+natural chords and stick it out for sharps. For example, left fist (C) plus
+right index + thumb gives C#. E and B have no sharp (E# and B# sound like F and
+C), so on those roots the right thumb is ignored. The chord table on the panel
+lists all 12 roots, with the sharp rows in gold. Press `C` to start or cancel
 the calibration wizard. Calibration is saved beside the script and is loaded
 automatically on the next run.
 
@@ -65,6 +72,11 @@ automatically on the next run.
 | G | G (`320003`) | Gm (`355333`) | G7 (`320001`) |
 | A | A (`x02220`) | Am (`x02210`) | A7 (`x02020`) |
 | B | B (`x24442`) | Bm (`x24432`) | B7 (`x21202`) |
+| C# / Db | C# (`x46664`) | C#m (`x46654`) | C#7 (`x46464`) |
+| D# / Eb | D# (`xx1343`) | D#m (`xx1342`) | D#7 (`xx1323`) |
+| F# / Gb | F# (`244322`) | F#m (`244222`) | F#7 (`242322`) |
+| G# / Ab | G# (`466544`) | G#m (`466444`) | G#7 (`464544`) |
+| A# / Bb | A# (`x13331`) | A#m (`x13321`) | A#7 (`x13131`) |
 
 The displayed fret strings use standard guitar chord notation, where `x`
 indicates a muted string and `0` indicates an open string.
@@ -152,7 +164,7 @@ The evaluation mode measures how well recognition works.
    python HandChordAI.py --participant P01
    ```
 
-2. The 21 chords are shown in random order, with no chord twice in a row.
+2. All 36 chords are shown in random order, with no chord twice in a row.
    For each chord you have 2 s to form it, then 3 s of recording while you
    hold it.
 3. Every frame is written to `evaluation/<participant>_<date>.csv`. The
@@ -195,8 +207,8 @@ are excluded from git. Back them up separately.
 5. Recent gesture votes are accumulated. A template is accepted only after
    enough matching frames in the short history.
 6. Calibration can replace the built-in finger templates with per-hand models
-   generated from six recorded poses.
-7. The root and quality are combined into one of 21 chord keys.
+   generated from seven recorded poses.
+7. The root and quality are combined into one of 36 chord keys.
 8. The matching WAV file from `sounds_v3` is looped asynchronously with Windows
    audio playback while the OpenCV interface continues rendering.
 

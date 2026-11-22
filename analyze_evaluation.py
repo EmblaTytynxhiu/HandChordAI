@@ -64,7 +64,10 @@ RESULTS_DIR = BASE_DIR / "results"
 # The four ways of predicting a gesture that the CSV contains.
 METHODS = ["stable", "frame", "fallback", "calibrated"]
 # The two hands. "root" -> columns like root_stable, target is target_root.
-HANDS = {"root": app.ROOTS, "quality": app.QUALITIES}
+# UPGRADE v3.3: the quality hand has 6 gestures now (MAJOR ... and #MAJOR ...),
+# so the confusion matrix also shows when the sharp thumb is mixed up.
+# Old recordings (before v3.3) only contain the first 3 names - that's fine.
+HANDS = {"root": app.ROOTS, "quality": app.QUALITY_GESTURES}
 
 
 # ------------------------------------------------------------

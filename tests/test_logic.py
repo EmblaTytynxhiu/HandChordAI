@@ -35,11 +35,11 @@ import HandChordAI as app  # noqa: E402  (import after the path fix on purpose)
 
 
 class ChordTableTests(unittest.TestCase):
-    """The 21 chords built at startup."""
+    """The chords built at startup (36 since UPGRADE v3.3, was 21)."""
 
-    def test_there_are_21_chords(self):
-        # 7 roots x 3 qualities.
-        self.assertEqual(len(app.CHORDS), 21)
+    def test_there_are_36_chords(self):
+        # UPGRADE v3.3: (7 natural + 5 sharp roots) x 3 qualities = 36.
+        self.assertEqual(len(app.CHORDS), 36)
 
     def test_e_minor_has_the_right_notes(self):
         chord = app.CHORDS["EMINOR"]
@@ -80,18 +80,103 @@ class GestureMatchingTests(unittest.TestCase):
                                                app.ROOT_TEMPLATES)
                 self.assertEqual(best, name)
 
-    def test_quality_ignores_the_thumb(self):
-        # Minor = index + middle. Thumb up or down must not matter.
-        for thumb in (0, 1):
-            probs = probs_from_pattern((thumb, 1, 1, 0, 0))
-            best, _, _ = app.match_gesture(probs, app.QUALITY_TEMPLATES)
-            self.assertEqual(best, "MINOR")
+    def test_quality_thumb_is_the_sharp_switch(self):
+        # UPGRADE v3.3: this test used to check that the thumb is IGNORED.
+        # Now the thumb matters: tucked = "MINOR", out = "#MINOR".
+        probs = probs_from_pattern((0, 1, 1, 0, 0))
+        self.assertEqual(app.match_gesture(probs, app.QUALITY_TEMPLATES)[0], "MINOR")
+        probs = probs_from_pattern((1, 1, 1, 0, 0))
+        self.assertEqual(app.match_gesture(probs, app.QUALITY_TEMPLATES)[0], "#MINOR")
+
+    def test_every_quality_gesture_is_recognised(self):
+        # UPGRADE v3.3: all 6 right-hand templates, fed back in, give themselves.
+        for name, pattern in app.QUALITY_TEMPLATES.items():
+            with self.subTest(quality=name):
+                best, _, _ = app.match_gesture(probs_from_pattern(pattern),
+                                               app.QUALITY_TEMPLATES)
+                self.assertEqual(best, name)
+
+    def test_unsure_thumb_gives_no_quality(self):
+        # UPGRADE v3.3: if the thumb is 50/50 we can't tell "MAJOR" from
+        # "#MAJOR". Better to say "unclear" than to guess the wrong chord.
+        probs = probs_from_pattern((0, 1, 0, 0, 0))
+        probs["THUMB"] = 0.5
+        self.assertIsNone(app.match_gesture(probs, app.QUALITY_TEMPLATES)[0])
 
     def test_unclear_hand_gives_no_gesture(self):
         # Every finger at 50% = "no idea" -> must return None, not a guess.
         probs = {finger: 0.5 for finger in app.FINGER_NAMES}
         best, _, _ = app.match_gesture(probs, app.ROOT_TEMPLATES)
         self.assertIsNone(best)
+
+
+class SharpChordTests(unittest.TestCase):
+    """UPGRADE v3.3: the sharp (#) chords and chord_name()."""
+
+    def test_chord_name_natural_and_sharp(self):
+        self.assertEqual(app.chord_name("E", "MINOR"), "EMINOR")     # like before
+        self.assertEqual(app.chord_name("C", "#MAJOR"), "C#MAJOR")   # thumb out
+        self.assertEqual(app.chord_name("A", "#7TH"), "A#7TH")
+
+    def test_e_and_b_ignore_the_sharp_thumb(self):
+        # No E# or B#: the thumb is ignored and you get the plain chord.
+        self.assertEqual(app.chord_name("E", "#MINOR"), "EMINOR")
+        self.assertEqual(app.chord_name("B", "#MAJOR"), "BMAJOR")
+
+    def test_every_gesture_pair_gives_a_real_chord(self):
+        # 7 root gestures x 6 quality gestures = 42 combinations. Each one
+        # must land on a chord that exists (otherwise there'd be no sound).
+        for root in app.ROOTS:
+            for quality in app.QUALITY_GESTURES:
+                with self.subTest(root=root, quality=quality):
+                    self.assertIn(app.chord_name(root, quality), app.CHORDS)
+
+    def test_c_sharp_major_notes_and_names(self):
+        chord = app.CHORDS["C#MAJOR"]
+        self.assertEqual(chord["display"], "C#")
+        self.assertEqual(chord["notes"], ["C#", "F", "G#"])  # F = E#, same key
+        self.assertIn("Db", chord["long_name"])               # flat name shown
+        self.assertEqual(chord["root"], "C")                  # left hand = C fist
+        self.assertEqual(chord["quality_gesture"], "#MAJOR")  # right thumb out
+
+    def test_a_sharp_minor_is_one_semitone_above_a_minor(self):
+        # Every string of A#m (x13321) vs Am (x02210) is one fret higher.
+        a = app.CHORDS["AMINOR"]["string_frequencies"]
+        a_sharp = app.CHORDS["A#MINOR"]["string_frequencies"]
+        for low, high in zip(a, a_sharp):
+            if low is not None:
+                self.assertAlmostEqual(high / low, 2 ** (1 / 12), places=6)
+
+
+class CalibrationSanityTests(unittest.TestCase):
+    """UPGRADE v3.3: a broken calibration must be refused, not saved.
+
+    Real bug this protects against: a calibration where the thumb wasn't
+    seen "out" during the open/thumb poses. The program trained on it,
+    saved it, and afterwards mixed up C/A and D/B (thumb in vs out)."""
+
+    def fake_profiles(self, thumb_gap=1.4, finger_gap=150.0):
+        """Helper: profiles where 'closed' minus 'open' on the main
+        measurement (thumb 'across', finger 'flex') equals the given gaps."""
+        def model(gap):
+            return {"open": {"mean": [0.0, 1, 1, 1], "std": [1, 1, 1, 1]},
+                    "closed": {"mean": [gap, 1, 1, 1], "std": [1, 1, 1, 1]}}
+        return {role: {f: model(thumb_gap if f == "THUMB" else finger_gap)
+                       for f in app.FINGER_NAMES} for role in app.ROLE_NAMES}
+
+    def test_good_calibration_passes(self):
+        # Gaps like the user's working calibration (thumb ~1.4, fingers 110+).
+        self.assertEqual(app.calibration_problems(self.fake_profiles()), [])
+
+    def test_thumb_not_seen_out_is_refused(self):
+        # Gap 0.19 = the real broken calibration from 2026-11-22.
+        problems = app.calibration_problems(self.fake_profiles(thumb_gap=0.19))
+        self.assertEqual(len(problems), 2)          # both hands' thumbs
+        self.assertIn("THUMB", problems[0])
+
+    def test_finger_not_bent_is_refused(self):
+        problems = app.calibration_problems(self.fake_profiles(finger_gap=20.0))
+        self.assertEqual(len(problems), 8)          # 4 fingers x 2 hands
 
 
 class VotingTests(unittest.TestCase):
@@ -167,8 +252,9 @@ class EvaluationTests(unittest.TestCase):
         # Try many seeds - a bug might only show up for some orders.
         for seed in range(200):
             order = app.make_trial_order(3, random.Random(seed))
-            # 3 repetitions x 21 chords, each chord exactly 3 times.
-            self.assertEqual(len(order), 63)
+            # 3 repetitions x every chord (36 since v3.3), each exactly 3 times.
+            # UPGRADE v3.3: counted from CHORDS instead of a typed 63.
+            self.assertEqual(len(order), 3 * len(app.CHORDS))
             self.assertEqual(set(order), set(app.CHORDS))
             # The same chord twice in a row would break the latency measurement.
             for a, b in zip(order, order[1:]):
