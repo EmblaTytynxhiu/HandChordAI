@@ -3,3 +3,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 screenshots/
+# UPGRADE v3.2: evaluation recordings and analysis output.
+# They contain hand measurements of real people (personal data), so they
+# are kept out of git. Back them up somewhere else for the thesis!
+evaluation/
+results/

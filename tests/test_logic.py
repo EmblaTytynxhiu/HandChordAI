@@ -159,5 +159,66 @@ class FeatureTests(unittest.TestCase):
             self.assertGreater(probs[finger], 0.5, f"{finger} p={probs[finger]:.2f}")
 
 
+class EvaluationTests(unittest.TestCase):
+    """UPGRADE v3.2: the evaluation mode and its analysis script."""
+
+    def test_trial_order_has_every_chord_and_no_repeats_in_a_row(self):
+        import random
+        # Try many seeds - a bug might only show up for some orders.
+        for seed in range(200):
+            order = app.make_trial_order(3, random.Random(seed))
+            # 3 repetitions x 21 chords, each chord exactly 3 times.
+            self.assertEqual(len(order), 63)
+            self.assertEqual(set(order), set(app.CHORDS))
+            # The same chord twice in a row would break the latency measurement.
+            for a, b in zip(order, order[1:]):
+                self.assertNotEqual(a, b, f"seed {seed}")
+
+    def make_rows(self, stable_from, frame_from):
+        """Helper: fake frames of one trial (target E minor) at 30 FPS.
+        The per-frame guess becomes right at 'frame_from' seconds,
+        the stable (voted) guess at 'stable_from' seconds."""
+        rows = []
+        for i in range(150):                 # 5 seconds x 30 frames
+            t = i / 30
+            rows.append({
+                "participant": "P00", "session": "s", "trial": 0,
+                "target": "EMINOR", "target_root": "E", "target_quality": "MINOR",
+                "live_classifier": "fallback", "t_trial": t,
+                "phase": "settle" if t < 2 else "record",
+                "root_visible": True, "quality_visible": True,
+                "root_frame": "E" if t >= frame_from else "D",
+                "quality_frame": "MINOR",
+                "root_stable": "E" if t >= stable_from else "NONE",
+                "quality_stable": "MINOR",
+            })
+        return rows
+
+    def test_latency_splits_human_and_system_time(self):
+        import analyze_evaluation as analysis
+        rows = self.make_rows(stable_from=1.0, frame_from=0.8)
+        result = analysis.trial_latencies(rows)[0]
+        self.assertTrue(result["success"])
+        self.assertAlmostEqual(result["t_stable"], 1.0, delta=1 / 30)
+        self.assertAlmostEqual(result["t_onset"], 0.8, delta=1 / 30)
+        self.assertAlmostEqual(result["decision_delay"], 0.2, delta=2 / 30)
+
+    def test_never_recognised_trial_is_a_failure(self):
+        import analyze_evaluation as analysis
+        rows = self.make_rows(stable_from=99, frame_from=99)
+        self.assertFalse(analysis.trial_latencies(rows)[0]["success"])
+
+    def test_accuracy_counts_only_record_phase(self):
+        import analyze_evaluation as analysis
+        # Stable is right from 2.5 s; the record phase is 2-5 s, so
+        # 0.5 s of its 3 s is wrong -> about 83% accuracy.
+        rows = analysis.scored_frames(self.make_rows(stable_from=2.5, frame_from=0))
+        acc, rejection, n = analysis.accuracy(rows, "chord", "stable")
+        self.assertEqual(n, 90)
+        self.assertAlmostEqual(acc, 75 / 90)
+        # The wrong frames were "NONE" -> counted as rejections, not errors.
+        self.assertAlmostEqual(rejection, 15 / 90)
+
+
 if __name__ == "__main__":
     unittest.main()

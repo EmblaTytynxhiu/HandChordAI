@@ -29,14 +29,36 @@ R       Reset gesture history
 SPACE   Replay the current chord
 M       Mute / unmute the sound                      (new in v3.1)
 S       Save a screenshot into the screenshots folder (new in v3.1)
+E       Start/stop an evaluation session              (new in v3.2)
 Q/ESC   Quit (closing the window with the X also works now)
 
-COMMAND-LINE OPTIONS (new in v3.1)
-----------------------------------
+COMMAND-LINE OPTIONS (new in v3.1, more in v3.2)
+------------------------------------------------
     python HandChordAI.py                 normal start
     python HandChordAI.py --camera 1      use the second webcam
     python HandChordAI.py --mute          start with the sound off
+    python HandChordAI.py --participant P03   name used in evaluation files (v3.2)
+    python HandChordAI.py --eval-reps 2   ask for every chord twice per session (v3.2)
+    python HandChordAI.py --force-fallback    ignore calibration, use the built-in
+                                              rules (for comparing the two) (v3.2)
     python HandChordAI.py --help          show all options
+
+WHAT CHANGED IN v3.2  (search the code for "UPGRADE v3.2" to find each one)
+---------------------------------------------------------------------------
+EVALUATION MODE - so the thesis can report real numbers.
+1. Press E: the program asks for all 21 chords in random order. For each
+   chord you get EVAL_SETTLE_SECONDS to form it, then EVAL_RECORD_SECONDS
+   of recording. Every frame is written to evaluation/<id>.csv, and the
+   settings used are written to evaluation/<id>.json.
+2. Each frame logs: target chord, what the system recognised (per frame
+   AND after voting), what the fallback rules AND the calibrated model
+   would say on their own, all finger features and probabilities.
+   -> accuracy, confusion matrices, latency, and fallback-vs-calibrated
+      comparison can all be computed afterwards from one recording.
+3. analyze_evaluation.py turns the CSV files into tables and plots.
+4. --participant, --eval-reps, --force-fallback command-line options.
+5. HandTrack now remembers raw_probs (before smoothing) and
+   frame_gesture (this frame's guess before voting), so they can be logged.
 
 WHAT CHANGED IN v3.1  (search the code for "UPGRADE v3.1" to find each one)
 ---------------------------------------------------------------------------
@@ -70,8 +92,10 @@ from __future__ import annotations
 
 # ---- Standard library (comes with Python) ----
 import argparse             # UPGRADE v3.1: reads options like --camera 1 from the command line
+import csv                  # UPGRADE v3.2: write evaluation recordings as spreadsheet-style files
 import json                 # read/write the calibration file
 import math                 # exp, log, sin, cos, pi ...
+import random               # UPGRADE v3.2: shuffle the chord order in an evaluation session
 import time                 # time.monotonic() = a clock that never goes backwards
 import urllib.request       # download the MediaPipe model file
 import wave                 # write .wav sound files
@@ -170,6 +194,20 @@ CAMERA_READ_RETRIES = 30
 # How smooth the FPS number is. 0.1 means: each new frame changes the
 # displayed value by only 10%, so the number doesn't jump around wildly.
 FPS_SMOOTHING = 0.1
+
+# ---- UPGRADE v3.2: evaluation mode settings (E key) ----
+# Recordings are saved in this folder (created automatically).
+EVAL_DIR = BASE_DIR / "evaluation"
+# Each chord ("trial") has two parts:
+#   settle = time to change your hands to the new chord. It IS logged
+#            (we need it to measure how long recognition takes), but the
+#            accuracy numbers only use the record part.
+#   record = time spent holding the chord. Accuracy is measured here.
+EVAL_SETTLE_SECONDS = 2.0
+EVAL_RECORD_SECONDS = 3.0
+# How many times each of the 21 chords is asked for in one session.
+# 1 -> 21 trials x 5 s = about 2 minutes. Change it with --eval-reps.
+EVAL_REPETITIONS = 1
 
 # Official MediaPipe hand model (downloaded once, ~7 MB).
 MODEL_URL = (
@@ -880,6 +918,10 @@ class HandTrack:
         self.image_points = None   # smoothed 21 points for drawing
         self.features = None       # latest finger measurements
         self.probs = None          # smoothed probability each finger is up
+        # UPGRADE v3.2: two extra things remembered only so the evaluation
+        # mode can log them (the normal program doesn't need them):
+        self.raw_probs = None      # this frame's probabilities BEFORE smoothing
+        self.frame_gesture = None  # this frame's best gesture BEFORE voting
         self.states = {name: False for name in FINGER_NAMES}  # final up/down
         self.trails = {name: deque(maxlen=12) for name in FINGER_NAMES}  # tip paths
         self.history = deque(maxlen=GESTURE_HISTORY_SIZE)  # recent gesture guesses
@@ -909,6 +951,11 @@ class HandTrack:
             raw = calibrated_probabilities(self.features, profile)
         else:
             raw = fallback_probabilities(self.features)
+        # UPGRADE v3.2: keep a copy for the evaluation log.
+        self.raw_probs = dict(raw)
+        # UPGRADE v3.2: clear last frame's guess; vote() fills it in again.
+        # (So an old guess can never be logged as if it were this frame's.)
+        self.frame_gesture = None
 
         # Step 4: smooth the probabilities over time (exponential moving average).
         if self.probs is None:
@@ -934,6 +981,9 @@ class HandTrack:
         """Match this frame's fingers to a gesture and add it to the history.
         The stable gesture only changes when enough recent frames agree."""
         name, posterior, fit = match_gesture(self.probs, templates)
+        # UPGRADE v3.2: remember this frame's guess (None = "unclear")
+        # so the evaluation log can compare it with the voted result.
+        self.frame_gesture = name
         self.history.append(name)
         self.gesture = stable_value(self.history)
         # Confidence shown in the UI (only meaningful if this frame agrees).
@@ -1114,6 +1164,272 @@ def load_calibration():
         # json.JSONDecodeError is a subclass of ValueError, so it's caught too.
         print("Saved calibration could not be loaded:", error)
         return None
+
+
+# ============================================================
+# 12b. EVALUATION MODE  (UPGRADE v3.2 - this whole section is new)
+# ============================================================
+# WHY?
+#   A thesis needs numbers: "how often is the right chord recognised?",
+#   "which gestures get confused?", "how long does it take?".
+#   The evaluation mode answers these by telling you which chord to make
+#   (so we KNOW the right answer = "ground truth") and logging what the
+#   system recognised on every single frame.
+#
+# HOW A SESSION WORKS
+#   1. Press E. The 21 chords are shuffled into a random order.
+#   2. For each chord ("trial"): the target is shown on the panel.
+#        - first EVAL_SETTLE_SECONDS: change your hands to the new chord
+#        - then  EVAL_RECORD_SECONDS: hold it still
+#   3. Every frame becomes one row in evaluation/<session id>.csv.
+#   4. When all trials are done (or you press E again) the file is closed.
+#   5. Run  python analyze_evaluation.py  to get the results.
+#
+# The recognition itself is NOT changed by this mode - it runs exactly
+# like normal use. The mode only watches and writes things down.
+
+# Which hand-related values go into each CSV row. Kept in one place so the
+# header and the rows always match. "root_" / "quality_" are added in front.
+EVAL_HAND_FIELDS = [
+    "visible",      # 1 = hand seen this frame, 0 = not seen
+    "frame",        # the pipeline's guess THIS frame (before voting)
+    "stable",       # the pipeline's guess AFTER voting (what the user sees)
+    "fallback",     # what the built-in rules alone would say this frame
+    "calibrated",   # what the calibrated model alone would say this frame
+]
+# How the gesture columns are filled in:
+#   a name like "E" or "MINOR" = that gesture
+#   "NONE" = the classifier saw the hand but wasn't sure enough ("unclear")
+#   ""  (empty) = not available (hand not visible, or no calibration exists)
+
+
+def evaluation_columns():
+    """The list of column names for the evaluation CSV, in order."""
+    columns = [
+        "participant",      # who did the session (--participant)
+        "session",          # session id = start date/time
+        "live_classifier",  # "calibrated" or "fallback": what the live pipeline used
+        "trial",            # trial number 0, 1, 2, ...
+        "target",           # the chord the user was asked for, e.g. "EMINOR"
+        "target_root",      # e.g. "E"
+        "target_quality",   # e.g. "MINOR"
+        "phase",            # "settle" or "record"
+        "t_trial",          # seconds since this trial started
+        "t_session",        # seconds since the session started
+        "fps",              # frames per second at that moment
+        "active_chord",     # chord shown on screen (may be left over from earlier)
+    ]
+    for role in ROLE_NAMES:
+        prefix = role.lower() + "_"           # "root_" or "quality_"
+        columns += [prefix + field for field in EVAL_HAND_FIELDS]
+        # Smoothed probability that each finger is up (what the pipeline uses).
+        columns += [f"{prefix}p_{finger}" for finger in FINGER_NAMES]
+        # The 4 raw measurements of every finger. Logging them means you can
+        # later try OTHER classifiers on exactly the same data, offline.
+        columns += [f"{prefix}{finger}_f{i}" for finger in FINGER_NAMES for i in range(4)]
+    return columns
+
+
+def make_trial_order(repetitions, rng):
+    """Shuffle the 21 chords into the order the user is asked for them.
+
+    repetitions = how many times each chord appears.
+    rng         = a random.Random object (seeded, so the order can be
+                  recreated later - the seed is saved in the .json file).
+
+    The same chord never comes twice in a row. That matters for the
+    latency measurement: if the chord didn't change, it would already be
+    "recognised" at time 0 and the measured time would be meaningless.
+    """
+    chords = list(CHORDS)          # the 21 internal names, e.g. "EMINOR"
+    order = []
+    for _ in range(repetitions):
+        block = chords[:]          # [:] = a copy, so shuffling doesn't touch 'chords'
+        rng.shuffle(block)
+        # Inside one block every chord appears once, so a repeat can only
+        # happen where two blocks meet. If so, swap the first two of the new block.
+        if order and block[0] == order[-1]:
+            block[0], block[1] = block[1], block[0]
+        order += block
+    return order
+
+
+def create_evaluation_session():
+    """A dictionary holding the evaluation session's progress.
+    Starts inactive; start_evaluation() fills it in."""
+    return {"active": False, "trials": [], "index": 0, "trial_start": 0.0,
+            "session_start": 0.0, "file": None, "writer": None, "rows": 0,
+            "meta": None, "meta_path": None, "notice": ""}
+
+
+def gesture_text(name):
+    """Turn a gesture result into CSV text: None -> "NONE", "E" -> "E"."""
+    return "NONE" if name is None else name
+
+
+def start_evaluation(session, now, participant, live_classifier, repetitions, camera_index):
+    """Begin a new evaluation session: pick the chord order, open the CSV
+    file and write a .json file describing all the settings used.
+
+    Saving the settings is important for a thesis: if you change, say,
+    REQUIRED_GESTURE_VOTES later, you can still tell which recordings
+    were made with which settings."""
+
+    EVAL_DIR.mkdir(parents=True, exist_ok=True)
+    session_id = time.strftime("%Y%m%d_%H%M%S")      # e.g. 20261122_143005
+    base = EVAL_DIR / f"{participant}_{session_id}"  # e.g. evaluation/P01_20261122_143005
+
+    # A random seed, saved so the exact same chord order can be recreated.
+    seed = random.randrange(1_000_000)
+    trials = make_trial_order(repetitions, random.Random(seed))
+
+    # newline="" is what Python's csv module wants (avoids blank lines on Windows).
+    csv_file = open(base.with_suffix(".csv"), "w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(csv_file, fieldnames=evaluation_columns())
+    writer.writeheader()
+
+    # Everything needed to describe this session in the thesis.
+    meta = {
+        "participant": participant,
+        "session": session_id,
+        "live_classifier": live_classifier,
+        "camera_index": camera_index,
+        "repetitions": repetitions,
+        "seed": seed,
+        "trials": trials,
+        "settings": {
+            "EVAL_SETTLE_SECONDS": EVAL_SETTLE_SECONDS,
+            "EVAL_RECORD_SECONDS": EVAL_RECORD_SECONDS,
+            "IMAGE_FILTER": IMAGE_FILTER,
+            "WORLD_FILTER": WORLD_FILTER,
+            "PROBABILITY_EMA": PROBABILITY_EMA,
+            "OPEN_THRESHOLD": OPEN_THRESHOLD,
+            "CLOSE_THRESHOLD": CLOSE_THRESHOLD,
+            "MIN_GESTURE_POSTERIOR": MIN_GESTURE_POSTERIOR,
+            "MIN_GESTURE_FIT": MIN_GESTURE_FIT,
+            "GESTURE_HISTORY_SIZE": GESTURE_HISTORY_SIZE,
+            "REQUIRED_GESTURE_VOTES": REQUIRED_GESTURE_VOTES,
+            "DETECTION_CONFIDENCE": DETECTION_CONFIDENCE,
+            "PRESENCE_CONFIDENCE": PRESENCE_CONFIDENCE,
+            "TRACKING_CONFIDENCE": TRACKING_CONFIDENCE,
+        },
+        "completed": False,      # set to True at the end if all trials were done
+        "trials_done": 0,
+    }
+
+    session.update({"active": True, "trials": trials, "index": 0,
+                    "trial_start": now, "session_start": now,
+                    "file": csv_file, "writer": writer, "rows": 0,
+                    "meta": meta, "meta_path": base.with_suffix(".json"),
+                    "notice": ""})
+    write_evaluation_meta(session)
+    print(f"Evaluation started ({len(trials)} trials). Recording to {base}.csv")
+
+
+def write_evaluation_meta(session):
+    """Save the session's .json description (called at the start and the end)."""
+    try:
+        session["meta_path"].write_text(json.dumps(session["meta"], indent=1),
+                                        encoding="utf-8")
+    except OSError as error:
+        print("Could not save evaluation info:", error)
+
+
+def finish_evaluation(session, completed):
+    """Close the CSV file and record whether the session was finished.
+    completed = True if every trial was done, False if E was pressed early.
+    An unfinished recording is still saved - the analysis can use it."""
+    if session["file"] is not None:
+        session["file"].close()
+    session["meta"]["completed"] = completed
+    session["meta"]["trials_done"] = session["index"] if not completed else len(session["trials"])
+    write_evaluation_meta(session)
+    session.update({"active": False, "file": None, "writer": None})
+    session["notice"] = ("Evaluation complete - saved." if completed
+                         else "Evaluation stopped early - partial recording saved.")
+    print(session["notice"], f"({session['rows']} frames)")
+
+
+def evaluation_row(session, state, now):
+    """Build one CSV row describing what happened in this frame."""
+    trial_number = session["index"]
+    target = session["trials"][trial_number]
+    t_trial = now - session["trial_start"]
+    meta = session["meta"]
+
+    row = {
+        "participant": meta["participant"],
+        "session": meta["session"],
+        "live_classifier": meta["live_classifier"],
+        "trial": trial_number,
+        "target": target,
+        "target_root": CHORDS[target]["root"],
+        "target_quality": CHORDS[target]["quality"],
+        "phase": "settle" if t_trial < EVAL_SETTLE_SECONDS else "record",
+        "t_trial": round(t_trial, 4),
+        "t_session": round(now - session["session_start"], 4),
+        "fps": round(state["fps"], 1),
+        "active_chord": state["active_chord"] or "",
+    }
+
+    profiles = state["profiles"]
+    for role in ROLE_NAMES:
+        track = state["tracks"][role]
+        prefix = role.lower() + "_"
+        templates = ROOT_TEMPLATES if role == "ROOT" else QUALITY_TEMPLATES
+        seen = track.visible and track.features is not None
+
+        row[prefix + "visible"] = int(seen)
+        # The stable (voted) gesture is what the user sees, so log it even
+        # when the hand is briefly gone (it stays on screen for a moment).
+        row[prefix + "stable"] = gesture_text(track.gesture)
+
+        if not seen:
+            # No hand -> no measurements. Leave those columns empty.
+            for field in ("frame", "fallback", "calibrated"):
+                row[prefix + field] = ""
+            continue
+
+        row[prefix + "frame"] = gesture_text(track.frame_gesture)
+
+        # Run BOTH classifiers on this frame's measurements, no matter which
+        # one the live pipeline uses. Then one recording lets you compare
+        # them on exactly the same hand poses. (Raw = no smoothing/voting.)
+        row[prefix + "fallback"] = gesture_text(
+            match_gesture(fallback_probabilities(track.features), templates)[0])
+        if profiles is not None:
+            row[prefix + "calibrated"] = gesture_text(
+                match_gesture(calibrated_probabilities(track.features, profiles[role]),
+                              templates)[0])
+        else:
+            row[prefix + "calibrated"] = ""   # no calibration exists
+
+        for finger in FINGER_NAMES:
+            row[f"{prefix}p_{finger}"] = round(track.probs[finger], 4)
+            for i, value in enumerate(track.features[finger]):
+                row[f"{prefix}{finger}_f{i}"] = round(float(value), 5)
+    return row
+
+
+def update_evaluation(session, state, now):
+    """Called every frame while an evaluation is running.
+    Moves on to the next trial when time is up, and logs the frame."""
+    if not session["active"]:
+        return
+
+    # Time for the next trial?
+    if now - session["trial_start"] >= EVAL_SETTLE_SECONDS + EVAL_RECORD_SECONDS:
+        session["index"] += 1
+        session["trial_start"] = now
+        if session["index"] >= len(session["trials"]):
+            finish_evaluation(session, completed=True)
+            return
+        # NOTE: the hand tracks are deliberately NOT reset here. Changing
+        # from the previous chord to the new one is exactly what we want
+        # to time, just like in real playing.
+
+    session["writer"].writerow(evaluation_row(session, state, now))
+    session["rows"] += 1
 
 
 # ============================================================
@@ -1525,6 +1841,54 @@ def draw_calibration_card(panel, session, now):
         draw_text(panel, "Press C to cancel", (35, 282), 0.34, MUTED)
 
 
+def draw_evaluation_card(panel, session, active_chord, now):
+    """UPGRADE v3.2: card shown during an evaluation session.
+    Shows which chord to make, how to make it, how much time is left,
+    and what the system currently recognises (green = correct)."""
+    cv2.rectangle(panel, (18, 100), (622, 290), CARD, -1)
+    cv2.rectangle(panel, (18, 100), (622, 290), BORDER, 1)
+
+    meta = session["meta"]
+    index = min(session["index"], len(session["trials"]) - 1)
+    target = CHORDS[session["trials"][index]]
+    draw_text(panel, f"EVALUATION  {meta['participant']}  "
+              f"trial {index + 1}/{len(session['trials'])}", (35, 127), 0.42, MINT, 2)
+
+    # The target chord, big, plus the two hand icons showing how to make it.
+    draw_text(panel, "Make:", (35, 160), 0.42, MUTED)
+    draw_text(panel, target["display"], (35, 215), 2.0, TEXT, 4)
+    draw_mini_hand(panel, 190, 210, ROOT_TEMPLATES[target["root"]], mirrored=True,
+                   size=1.2, highlight=True)
+    draw_text(panel, "+", (248, 200), 0.5, MUTED)
+    draw_mini_hand(panel, 266, 210, QUALITY_TEMPLATES[target["quality"]], mirrored=False,
+                   size=1.2, highlight=True)
+
+    # What the system recognises right now (only the voted, stable result).
+    draw_text(panel, "Recognised:", (360, 160), 0.42, MUTED)
+    if active_chord:
+        correct = active_chord == session["trials"][index]
+        draw_text(panel, CHORDS[active_chord]["display"], (360, 215), 1.6,
+                  SUCCESS if correct else DANGER, 3)
+    else:
+        draw_text(panel, "-", (360, 215), 1.6, MUTED, 3)
+
+    # Phase text + progress bar for this trial.
+    elapsed = now - session["trial_start"]
+    if elapsed < EVAL_SETTLE_SECONDS:
+        draw_text(panel, "Change to this chord...", (35, 250), 0.42, GOLD)
+    else:
+        draw_text(panel, "Recording - hold it", (35, 250), 0.42, SUCCESS)
+    progress = np.clip(elapsed / (EVAL_SETTLE_SECONDS + EVAL_RECORD_SECONDS), 0, 1)
+    cv2.rectangle(panel, (35, 260), (600, 270), BORDER, -1)
+    cv2.rectangle(panel, (35, 260), (35 + int(565 * progress), 270),
+                  GOLD if elapsed < EVAL_SETTLE_SECONDS else SUCCESS, -1)
+    # Small mark where recording starts, so you can see the two phases.
+    settle_x = 35 + int(565 * EVAL_SETTLE_SECONDS / (EVAL_SETTLE_SECONDS + EVAL_RECORD_SECONDS))
+    cv2.line(panel, (settle_x, 256), (settle_x, 274), TEXT, 1)
+
+    draw_text(panel, "Press E to stop (the recording so far is kept)", (35, 284), 0.33, MUTED)
+
+
 def draw_chord_card(panel, active_chord, notice):
     """Card showing the current chord: name, notes, how-to icons, fretboard."""
     cv2.rectangle(panel, (18, 100), (622, 290), CARD, -1)
@@ -1621,9 +1985,15 @@ def draw_panel(display, state, now):
     draw_text(panel, "TWO-HAND CHORD CONTROLLER", (24, 70), 0.40, MUTED)
 
     calibrated = state["profiles"] is not None
-    draw_text(panel, "CALIBRATED" if calibrated else "NOT CALIBRATED - PRESS C",
-              (360 if not calibrated else 500, 40), 0.38,
-              SUCCESS if calibrated else GOLD, 1)
+    if state["force_fallback"]:
+        # UPGRADE v3.2: --force-fallback was used, so the calibration is
+        # ignored even if it exists. Say so, so you never forget which
+        # mode a recording was made in.
+        draw_text(panel, "FALLBACK RULES (forced)", (400, 40), 0.38, WARNING, 1)
+    else:
+        draw_text(panel, "CALIBRATED" if calibrated else "NOT CALIBRATED - PRESS C",
+                  (360 if not calibrated else 500, 40), 0.38,
+                  SUCCESS if calibrated else GOLD, 1)
     # UPGRADE v3.1: show "MUTED" (orange) when M was pressed / --mute was used.
     if state["muted"]:
         draw_text(panel, "MUTED (M)", (500, 70), 0.40, WARNING, 2)
@@ -1638,10 +2008,16 @@ def draw_panel(display, state, now):
 
     # ---- Big card: calibration wizard OR current chord ----
     session = state["calibration"]
+    evaluation = state["evaluation"]   # UPGRADE v3.2
     if session["active"]:
         draw_calibration_card(panel, session, now)
+    elif evaluation["active"]:
+        # UPGRADE v3.2: evaluation card replaces the chord card.
+        draw_evaluation_card(panel, evaluation, state["active_chord"], now)
     else:
-        draw_chord_card(panel, state["active_chord"], session["notice"])
+        # UPGRADE v3.2: show the evaluation's "saved" message too, if newer.
+        draw_chord_card(panel, state["active_chord"],
+                        evaluation["notice"] or session["notice"])
 
     # ---- Live status of both hands ----
     tracks = state["tracks"]
@@ -1656,7 +2032,8 @@ def draw_panel(display, state, now):
 
     # ---- Footer ----
     # UPGRADE v3.1: added M (mute) and S (screenshot) to the key list.
-    draw_text(panel, "C Calib | G Guide | D Debug | R Reset | SPACE Replay | "
+    # UPGRADE v3.2: added E (evaluation); "SPACE" shortened to "SPC" to fit.
+    draw_text(panel, "C Calib | E Eval | G Guide | D Debug | R Reset | SPC Replay | "
               "M Mute | S Shot | Q Quit", (18, 700), 0.33, MUTED)
 
 
@@ -1777,6 +2154,14 @@ def compose_display(frame, state, now):
             pose = CALIBRATION_POSES[min(session["phase"], len(CALIBRATION_POSES) - 1)]
             draw_text(view, f"CALIBRATION {session['phase'] + 1}/"
                       f"{len(CALIBRATION_POSES)}: {pose[0]}", (20, 88), 0.5, GOLD, 2)
+        elif state["evaluation"]["active"]:
+            # UPGRADE v3.2: a red "REC" label so it's obvious frames are being saved.
+            evaluation = state["evaluation"]
+            target = CHORDS[evaluation["trials"][min(evaluation["index"],
+                                                     len(evaluation["trials"]) - 1)]]
+            draw_text(view, f"REC  EVALUATION {evaluation['index'] + 1}/"
+                      f"{len(evaluation['trials'])}: {target['display']}",
+                      (20, 88), 0.5, DANGER, 2)
         elif state["debug"]:
             draw_debug(view, state["tracks"])
 
@@ -1869,15 +2254,31 @@ def parse_arguments():
                              "if you have more than one camera)")
     parser.add_argument("--mute", action="store_true",
                         help="start with the sound turned off (press M to unmute)")
-    return parser.parse_args()
+    # ---- UPGRADE v3.2: evaluation options ----
+    parser.add_argument("--participant", default="P00",
+                        help="participant code written into evaluation files "
+                             "(e.g. P01). Use codes, not real names, for privacy.")
+    parser.add_argument("--eval-reps", type=int, default=EVAL_REPETITIONS,
+                        help=f"how many times each chord is asked for in one "
+                             f"evaluation session (default {EVAL_REPETITIONS})")
+    parser.add_argument("--force-fallback", action="store_true",
+                        help="ignore the saved calibration and use the built-in "
+                             "rules (to compare the two in an evaluation)")
+    arguments = parser.parse_args()
+    # Protect against e.g. --eval-reps 0, which would make an empty session.
+    if arguments.eval_reps < 1:
+        parser.error("--eval-reps must be 1 or more")
+    return arguments
 
 
-def run_application(camera_index=CAMERA_INDEX, start_muted=False):
+def run_application(camera_index=CAMERA_INDEX, start_muted=False,
+                    participant="P00", eval_reps=EVAL_REPETITIONS, force_fallback=False):
     """Set everything up, then run the frame loop until you quit.
 
-    UPGRADE v3.1: the two parameters come from the command line
+    UPGRADE v3.1: the parameters come from the command line
     (see parse_arguments). Calling run_application() with no arguments
-    still works exactly like before."""
+    still works exactly like before.
+    UPGRADE v3.2: added participant, eval_reps and force_fallback."""
 
     print("=" * 48)
     print("HANDCHORD AI - VIRTUAL GUITAR v3")
@@ -1900,9 +2301,13 @@ def run_application(camera_index=CAMERA_INDEX, start_muted=False):
         "debug": False,                     # D key
         "muted": start_muted,               # UPGRADE v3.1: M key / --mute
         "fps": 0.0,                         # UPGRADE v3.1: smoothed frames per second
+        "evaluation": create_evaluation_session(),  # UPGRADE v3.2: E key
+        "force_fallback": force_fallback,   # UPGRADE v3.2: --force-fallback
     }
     print("Personal calibration loaded." if state["profiles"]
           else "No calibration yet - press C in the window.")
+    if force_fallback:
+        print("--force-fallback: the calibration is ignored; built-in rules are used.")
 
     camera = open_camera(camera_index)
     detector = create_hand_detector()
@@ -1970,7 +2375,9 @@ def run_application(camera_index=CAMERA_INDEX, start_muted=False):
                 track = tracks[role]
                 if role in roles:
                     # Use this hand's calibration if we have one.
-                    profile = state["profiles"][role] if state["profiles"] else None
+                    # UPGRADE v3.2: ...unless --force-fallback was given.
+                    use_calibration = state["profiles"] and not state["force_fallback"]
+                    profile = state["profiles"][role] if use_calibration else None
                     track.update(roles[role], now, profile)
                 else:
                     # Hand not visible this frame.
@@ -2028,6 +2435,13 @@ def run_application(camera_index=CAMERA_INDEX, start_muted=False):
                 state["playing_chord"] = None
 
             # ------------------------------------------------
+            # 5b. UPGRADE v3.2: log this frame if an evaluation is running.
+            #     Done AFTER recognition, so the row contains this frame's
+            #     final results.
+            # ------------------------------------------------
+            update_evaluation(state["evaluation"], state, now)
+
+            # ------------------------------------------------
             # 6. Draw everything and show the window
             # ------------------------------------------------
             for role in ROLE_NAMES:
@@ -2047,10 +2461,16 @@ def run_application(camera_index=CAMERA_INDEX, start_muted=False):
             # Convert to a lowercase letter so C and c both work.
             char = chr(key).lower() if key < 128 else ""
 
+            evaluation = state["evaluation"]   # UPGRADE v3.2: short name for below
+
             if char == "c":
                 if session["active"]:
                     cancel_calibration(session)
                     print("Calibration cancelled.")
+                elif evaluation["active"]:
+                    # UPGRADE v3.2: calibrating in the middle of an evaluation
+                    # would change the classifier halfway through the data.
+                    print("Stop the evaluation first (press E).")
                 else:
                     # Silence everything and start the wizard.
                     stop_chord()
@@ -2058,6 +2478,22 @@ def run_application(camera_index=CAMERA_INDEX, start_muted=False):
                     state["active_chord"] = None
                     state["show_guide"] = False
                     start_calibration(session, time.monotonic())
+
+            elif char == "e":
+                # UPGRADE v3.2: E = start / stop an evaluation session.
+                if evaluation["active"]:
+                    finish_evaluation(evaluation, completed=False)
+                elif session["active"]:
+                    print("Finish or cancel the calibration first (press C).")
+                else:
+                    # Which classifier the live pipeline uses - saved with the
+                    # data so the analysis can compare the two conditions.
+                    live = ("calibrated" if state["profiles"] and not state["force_fallback"]
+                            else "fallback")
+                    state["show_guide"] = False   # the guide would hide the camera view
+                    evaluation["notice"] = ""
+                    start_evaluation(evaluation, time.monotonic(), participant, live,
+                                     eval_reps, camera_index)
 
             elif char == "g":
                 state["show_guide"] = not state["show_guide"]
@@ -2110,6 +2546,10 @@ def run_application(camera_index=CAMERA_INDEX, start_muted=False):
     finally:
         # Always clean up: stop sound, free the camera, close the window.
         print("Closing Virtual Guitar...")
+        # UPGRADE v3.2: if you quit during an evaluation, close the file
+        # properly so the frames recorded so far are not lost.
+        if state["evaluation"]["active"]:
+            finish_evaluation(state["evaluation"], completed=False)
         stop_chord()
         camera.release()
         detector.close()
@@ -2125,7 +2565,11 @@ if __name__ == "__main__":
     try:
         # UPGRADE v3.1: read --camera / --mute and pass them on.
         arguments = parse_arguments()
-        run_application(camera_index=arguments.camera, start_muted=arguments.mute)
+        # UPGRADE v3.2: also pass on the evaluation options.
+        run_application(camera_index=arguments.camera, start_muted=arguments.mute,
+                        participant=arguments.participant,
+                        eval_reps=arguments.eval_reps,
+                        force_fallback=arguments.force_fallback)
     except KeyboardInterrupt:
         # Ctrl+C in the terminal = normal quit.
         print("\nApplication interrupted.")

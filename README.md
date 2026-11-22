@@ -107,6 +107,9 @@ Command-line options:
 | --- | --- |
 | `--camera N` | Use webcam number `N` (default `0`) |
 | `--mute` | Start with sound off (press `M` to turn it on) |
+| `--participant P01` | Participant code written into evaluation files |
+| `--eval-reps N` | Ask for every chord `N` times per evaluation session (default `1`) |
+| `--force-fallback` | Ignore the calibration and use the built-in rules |
 | `--help` | List all options |
 
 At startup the program opens the webcam and loads `finger_calibration.json` if
@@ -120,6 +123,7 @@ and do not need to be created manually.
 | Key | Action |
 | --- | --- |
 | `C` | Start/cancel the calibration wizard |
+| `E` | Start/stop an evaluation session |
 | `G` | Show/hide the gesture guide |
 | `D` | Toggle diagnostic information |
 | `R` | Reset gesture recognition history and the active chord |
@@ -131,11 +135,52 @@ and do not need to be created manually.
 ## Tests
 
 The non-camera logic (chord table, gesture matching, voting, filtering,
-finger features) has automatic tests that use only built-in Python:
+finger features, evaluation trial order, accuracy and latency analysis) has
+automatic tests that use only built-in Python:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover tests
 ```
+
+## Evaluation
+
+The evaluation mode measures how well recognition works.
+
+1. Start the program with a participant code, then press `E`:
+
+   ```powershell
+   python HandChordAI.py --participant P01
+   ```
+
+2. The 21 chords are shown in random order, with no chord twice in a row.
+   For each chord you have 2 s to form it, then 3 s of recording while you
+   hold it.
+3. Every frame is written to `evaluation/<participant>_<date>.csv`. The
+   settings used (thresholds, filters, voting, random seed) are written to a
+   matching `.json` file. Pressing `E` again stops early and keeps the data.
+4. Analyse all recordings:
+
+   ```powershell
+   python analyze_evaluation.py
+   ```
+
+The analysis prints, and saves in `results/`:
+
+- **Accuracy** per hand and per chord for four methods: `stable` (the full
+  pipeline the user sees), `frame` (per-frame result without voting),
+  `fallback` and `calibrated` (each classifier alone on single frames).
+  Both classifiers are run on every frame, so one recording compares them on
+  identical hand poses. "Unclear" answers are reported separately as the
+  rejection rate.
+- **Confusion matrices** for the root and quality hands
+  (`--method frame` etc. picks the method to plot).
+- **Latency** per trial: time from the chord being shown to the correct
+  chord, and the part of that time caused by the voting step.
+
+To compare the live pipelines, record one session normally and one with
+`--force-fallback`. The analysis splits results by condition. Recordings
+contain body measurements of participants, so `evaluation/` and `results/`
+are excluded from git. Back them up separately.
 
 ## How it works
 
