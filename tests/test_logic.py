@@ -306,5 +306,59 @@ class EvaluationTests(unittest.TestCase):
         self.assertAlmostEqual(rejection, 15 / 90)
 
 
+class HeldChordAudioTests(unittest.TestCase):
+    """UPGRADE v3.4: the held-chord player. These never open the sound card:
+    they call ChordPlayer.render() directly, which is exactly what the
+    sound card would call, and check the numbers it returns."""
+
+    def setUp(self):
+        self.player = app.ChordPlayer()     # no .start() -> no speakers needed
+        self.rate = app.SAMPLE_RATE
+
+    def test_sustain_loop_is_seamless(self):
+        # The end of the loop must flow into its start: the jump from the
+        # last sample to the first should be no bigger than a normal step
+        # between two neighbouring samples. A big jump = an audible click.
+        ring = app.build_sustain_loop(app.CHORDS["EMINOR"])
+        normal_step = np.max(np.abs(np.diff(ring)))
+        wrap_step = abs(float(ring[0]) - float(ring[-1]))
+        self.assertLessEqual(wrap_step, normal_step * 1.01)
+
+    def test_chord_still_sounds_after_10_seconds(self):
+        # THE ACTUAL FEATURE: hold a chord for 10 s (much longer than the
+        # old 2 s file) and it must still be clearly audible at the end.
+        self.player.play("CMAJOR")
+        block = 4410                                   # 0.1 s per render
+        for _ in range(99):                            # first 9.9 s
+            self.player.render(block)
+        last = self.player.render(block)               # 9.9 - 10.0 s
+        self.assertGreater(np.sqrt(np.mean(last ** 2)), 0.05)
+
+    def test_release_fades_to_silence_and_removes_the_voice(self):
+        self.player.play("GMAJOR")
+        self.player.render(self.rate)                  # 1 s of sound
+        self.player.release_all()
+        # A bit longer than RELEASE_FADE_SECONDS -> must be silent and gone.
+        self.player.render(int(self.rate * (app.RELEASE_FADE_SECONDS + 0.05)))
+        self.assertFalse(self.player.is_sounding())
+        self.assertEqual(np.max(np.abs(self.player.render(1000))), 0.0)
+
+    def test_changing_chord_fades_the_old_one(self):
+        self.player.play("AMINOR")
+        self.player.render(1000)
+        self.player.play("DMAJOR")
+        # Right after the change both voices exist; the old one is fading.
+        self.assertEqual(len(self.player.voices), 2)
+        self.assertTrue(self.player.voices[0]["releasing"])
+        self.assertFalse(self.player.voices[1]["releasing"])
+        self.player.render(self.rate)                  # wait 1 s
+        self.assertEqual(len(self.player.voices), 1)   # only D major left
+
+    def test_output_never_clips_past_full_volume(self):
+        self.player.play("EMAJOR")
+        audio = self.player.render(self.rate * 3)
+        self.assertLessEqual(np.max(np.abs(audio)), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

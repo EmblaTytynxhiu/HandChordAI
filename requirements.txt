@@ -5,6 +5,10 @@
 opencv-python>=4.8
 mediapipe>=0.10.14
 numpy>=1.24
+# UPGRADE v3.4: streams the sound so a chord rings for as long as you hold
+# it (instead of re-strumming a 2-second file). Without it the program
+# still runs, using the old winsound looping.
+sounddevice>=0.4
 # UPGRADE v3.2: only needed for the plots in analyze_evaluation.py.
 # (The analysis still prints all numbers without it.)
 matplotlib>=3.7

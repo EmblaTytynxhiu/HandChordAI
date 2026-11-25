@@ -44,6 +44,28 @@ COMMAND-LINE OPTIONS (new in v3.1, more in v3.2)
                                               rules (for comparing the two) (v3.2)
     python HandChordAI.py --help          show all options
 
+WHAT CHANGED IN v3.4  (search the code for "UPGRADE v3.4" to find each one)
+---------------------------------------------------------------------------
+HELD CHORDS - the chord now rings for as long as you hold the gesture.
+1. THE PROBLEM: every chord was a 2-second .wav file (LOOP_DURATION) that
+   winsound looped. A plucked string dies away, so you heard: strum ->
+   fade to nothing -> strum again, every 2 seconds. It felt like the
+   chord only lasted 2 seconds.
+2. THE FIX: a new streaming audio player (class ChordPlayer, uses the
+   'sounddevice' library). When a chord starts it plays the strum ONCE,
+   and underneath it slowly fades in a steady "ringing" version of the
+   same chord (SUSTAIN_*). That ringing part loops seamlessly with no
+   restart, so the chord keeps sounding until your hands change.
+3. When the gesture ends (after RELEASE_GRACE_SECONDS, like before) the
+   sound fades out over RELEASE_FADE_SECONDS instead of being cut off.
+   Changing chord = old chord fades out while the new one is strummed.
+4. If sounddevice is missing or the sound card can't be opened, the
+   program automatically falls back to the OLD winsound behaviour, so
+   nothing breaks. The panel shows "(winsound fallback)" in that case.
+5. play_chord() / stop_chord() keep their names and arguments, so the
+   rest of the program didn't need to change. close_audio() is new and
+   is called when the program quits.
+
 WHAT CHANGED IN v3.3  (search the code for "UPGRADE v3.3" to find each one)
 ---------------------------------------------------------------------------
 SHARP (#) CHORDS - 21 chords became 36.
@@ -148,6 +170,19 @@ try:
 except ImportError:
     winsound = None
 
+# UPGRADE v3.4: sounddevice lets us STREAM sound (send it to the speakers
+# bit by bit while the program runs). That is what makes it possible to
+# hold a chord for as long as the hands hold the gesture - winsound can
+# only play/loop a whole file. If sounddevice isn't installed we set it to
+# None and the program falls back to the old winsound looping.
+# (Install it with:  python -m pip install sounddevice)
+try:
+    import sounddevice
+except Exception:          # ImportError, or OSError if PortAudio is missing
+    sounddevice = None
+
+import threading            # UPGRADE v3.4: a Lock so the audio thread and the main loop don't clash
+
 
 # ============================================================
 # 1. CONFIGURATION  (change these numbers to tweak behaviour)
@@ -168,6 +203,23 @@ WINDOW_NAME = "HandChordAI - Virtual Guitar"
 SAMPLE_RATE = 44100         # audio samples per second (CD quality)
 LOOP_DURATION = 2.0         # length of one .wav = one strum every 2 seconds
 STRUM_DELAY = 0.018         # 18 ms gap between strings -> sounds like a strum
+# NOTE (v3.4): LOOP_DURATION is now only the length of the STRUM part.
+# The chord itself lasts as long as you hold it (see the SUSTAIN_ settings).
+
+# ---- UPGRADE v3.4: held-chord settings (streaming player, ChordPlayer) ----
+SUSTAIN_LOOP_SECONDS = 4.0    # length of the seamless "ringing" loop. Every
+                              # note is nudged (max 0.125 Hz, too small to hear)
+                              # so it fits a whole number of waves in 4 s ->
+                              # the loop's end joins its start without a click.
+SUSTAIN_LEVEL = 0.30          # loudness of the held ring (strum peak is 0.80)
+SUSTAIN_FADE_IN_START = 0.15  # seconds after the strum when the ring starts fading in
+SUSTAIN_FADE_IN_SECONDS = 1.2 # how long the ring takes to reach full loudness
+SUSTAIN_HARMONICS = (1.0, 0.45, 0.22, 0.10)  # loudness of overtones 1x,2x,3x,4x
+                              # (a pure sine sounds like a beep; overtones = warmer)
+SUSTAIN_WOBBLE_HZ = 0.5       # gentle volume "breathing" so the ring sounds alive
+SUSTAIN_WOBBLE_DEPTH = 0.06   # +-6 % volume (0.5 Hz fits 2 times in 4 s -> seamless)
+RELEASE_FADE_SECONDS = 0.20   # fade-out when the chord ends (no hard cut / click)
+AUDIO_BLOCK_SIZE = 512        # samples per chunk sent to the sound card (~12 ms)
 
 # ---- MediaPipe detector ----
 MAX_HANDS = 2
@@ -1755,8 +1807,231 @@ def create_chord_files():
     print("Chord sounds ready.")
 
 
+# ------------------------------------------------------------
+# UPGRADE v3.4: HELD CHORDS - the streaming player
+# ------------------------------------------------------------
+# Before v3.4 a chord was a 2 s .wav looped by winsound: strum, die away,
+# strum again every 2 s. Now the ChordPlayer below builds the sound live,
+# chunk by chunk (AUDIO_BLOCK_SIZE samples at a time):
+#
+#     sound(t) = strum(t)                 the .wav, played ONCE
+#              + fade_in(t) * ring(t)     a steady chord that loops forever
+#
+# - strum(t): the same Karplus-Strong strum as before (read from the .wav).
+# - ring(t):  the chord's notes as gentle sine waves + overtones. Each note
+#             is nudged so a whole number of waves fits in
+#             SUSTAIN_LOOP_SECONDS, so when the loop restarts it continues
+#             exactly where it started -> no click, no re-strum.
+# - fade_in:  0 -> 1, so the ring takes over smoothly while the strum dies.
+#
+# The chord keeps ringing until stop_chord() is called (= the hands stopped
+# making the chord for RELEASE_GRACE_SECONDS). Then it fades out over
+# RELEASE_FADE_SECONDS instead of stopping with a click.
+#
+# Each sounding chord is a "voice". Normally there is one; while you change
+# chord there are briefly two (old one fading out, new one strumming).
+
+def build_sustain_loop(chord):
+    """UPGRADE v3.4: make the seamless "ringing" loop for one chord.
+    Returns a float32 array of SUSTAIN_LOOP_SECONDS whose end joins its
+    start perfectly (so it can repeat forever without clicking)."""
+
+    sample_count = int(SAMPLE_RATE * SUSTAIN_LOOP_SECONDS)
+    t = np.arange(sample_count) / SAMPLE_RATE      # time of every sample, in seconds
+    ring = np.zeros(sample_count)
+
+    # Same fixed-seed idea as generate_chord(): same chord = same sound.
+    rng = np.random.default_rng(sum(ord(c) * (i + 3) for i, c in enumerate(chord["fret"])))
+
+    played = [f for f in chord["string_frequencies"] if f is not None]
+    for order, frequency in enumerate(played):
+        for harmonic, loudness in enumerate(SUSTAIN_HARMONICS, start=1):
+            # THE SEAMLESS-LOOP TRICK: round the frequency so it does a whole
+            # number of waves in the loop. E.g. with a 4 s loop, 82.41 Hz ->
+            # 82.50 Hz (330 waves in 4 s). The change is at most 0.125 Hz,
+            # which nobody can hear, but now sample [end] flows into [0].
+            cycles = max(1, round(frequency * harmonic * SUSTAIN_LOOP_SECONDS))
+            exact = cycles / SUSTAIN_LOOP_SECONDS
+            if exact >= SAMPLE_RATE / 2:   # above what the sound card can play
+                continue
+            phase = rng.uniform(0, 2 * math.pi)   # random start -> less "buzzy"
+            # Higher strings a bit quieter, like in the strum.
+            ring += loudness * (1.0 - 0.04 * order) * np.sin(2 * math.pi * exact * t + phase)
+
+    # Gentle volume "breathing" (0.5 Hz fits 2 whole times in 4 s -> still seamless).
+    ring *= 1.0 + SUSTAIN_WOBBLE_DEPTH * np.sin(2 * math.pi * SUSTAIN_WOBBLE_HZ * t)
+
+    peak = np.max(np.abs(ring))
+    if peak > 0:
+        ring = ring / peak * SUSTAIN_LEVEL
+    return ring.astype(np.float32)
+
+
+def load_strum(chord_name):
+    """UPGRADE v3.4: read a chord's strum .wav into a float32 array (-1..1).
+    Creates the file first if it's missing."""
+    path = SOUND_DIR / f"{chord_name}.wav"
+    if not path.exists():
+        SOUND_DIR.mkdir(parents=True, exist_ok=True)
+        generate_chord(CHORDS[chord_name], path)
+    with wave.open(str(path), "rb") as wav_file:
+        frames = wav_file.readframes(wav_file.getnframes())
+    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
+
+
+class ChordPlayer:
+    """UPGRADE v3.4: plays chords for as long as they are held.
+
+    How it's used (the rest of the program only calls play_chord() and
+    stop_chord() further down, which call these):
+        player.play("EMINOR")   strum E minor, then keep it ringing
+        player.release_all()    fade out whatever is sounding
+
+    The sound card asks for the next chunk of sound ~86 times per second,
+    on its OWN thread (in parallel with the camera loop). It calls
+    _callback(), which calls render(). The Lock makes sure the main loop
+    never changes the voice list halfway through a render."""
+
+    def __init__(self):
+        self.voices = []                 # chords currently sounding (dicts)
+        self.cache = {}                  # chord name -> (strum, ring) arrays
+        self.lock = threading.Lock()
+        self.stream = None               # the sounddevice output stream
+        # How much the volume drops per sample while fading out.
+        self.release_step = 1.0 / max(1, int(SAMPLE_RATE * RELEASE_FADE_SECONDS))
+
+    # ---- opening / closing the sound card connection ----
+    def start(self):
+        """Open the speakers. Raises an error if that's impossible
+        (init_audio() catches it and falls back to winsound)."""
+        self.stream = sounddevice.OutputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+            blocksize=AUDIO_BLOCK_SIZE, callback=self._callback)
+        self.stream.start()
+
+    def close(self):
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+
+    # ---- controlling which chords sound (called from the main loop) ----
+    def sounds_for(self, chord_name):
+        """Get (strum, ring) for a chord, building them the first time.
+        Done in the MAIN thread, never in the audio thread, because building
+        takes a few milliseconds and the audio thread must never be late."""
+        if chord_name not in self.cache:
+            self.cache[chord_name] = (load_strum(chord_name),
+                                      build_sustain_loop(CHORDS[chord_name]))
+        return self.cache[chord_name]
+
+    def play(self, chord_name):
+        """Start a new chord (strum + endless ring). Any chord that is still
+        sounding is faded out, so changing chord sounds smooth."""
+        strum, ring = self.sounds_for(chord_name)
+        with self.lock:
+            for voice in self.voices:
+                voice["releasing"] = True
+            self.voices.append({"strum": strum, "ring": ring, "pos": 0,
+                                "gain": 1.0, "releasing": False})
+
+    def release_all(self):
+        """Fade out everything (over RELEASE_FADE_SECONDS)."""
+        with self.lock:
+            for voice in self.voices:
+                voice["releasing"] = True
+
+    def is_sounding(self):
+        with self.lock:
+            return bool(self.voices)
+
+    # ---- making the actual sound (runs on the audio thread) ----
+    def render(self, frame_count):
+        """Mix all voices into the next 'frame_count' samples.
+        Kept separate from _callback() so the tests can call it directly."""
+        out = np.zeros(frame_count, dtype=np.float32)
+        with self.lock:
+            for voice in self.voices:
+                # Sample numbers inside this voice for this chunk.
+                idx = voice["pos"] + np.arange(frame_count)
+
+                # 1. The strum - only while the .wav still has samples left.
+                strum = voice["strum"]
+                signal = np.zeros(frame_count, dtype=np.float32)
+                inside = idx < len(strum)
+                signal[inside] = strum[idx[inside]]
+
+                # 2. The ring - "% len(ring)" makes it repeat forever.
+                fade = np.clip((idx / SAMPLE_RATE - SUSTAIN_FADE_IN_START)
+                               / SUSTAIN_FADE_IN_SECONDS, 0.0, 1.0)
+                signal += voice["ring"][idx % len(voice["ring"])] * fade
+
+                # 3. Fade-out: lower the volume a tiny bit every sample.
+                if voice["releasing"]:
+                    gains = voice["gain"] - self.release_step * np.arange(1, frame_count + 1)
+                    gains = np.clip(gains, 0.0, 1.0)
+                    signal *= gains
+                    voice["gain"] = float(gains[-1])
+
+                out += signal
+                voice["pos"] += frame_count
+
+            # Voices that have faded to silence are finished -> remove them.
+            self.voices = [v for v in self.voices if v["gain"] > 0.0]
+
+        # Two chords overlapping for a moment could go above 1.0 -> clip.
+        return np.clip(out, -1.0, 1.0)
+
+    def _callback(self, outdata, frames, time_info, status):
+        """Called by sounddevice whenever the speakers need more sound."""
+        outdata[:, 0] = self.render(frames)
+
+
+# UPGRADE v3.4: the one player the whole program shares. Stays None if
+# sounddevice is unavailable -> then the old winsound code is used.
+audio_player = None
+
+
+def init_audio():
+    """UPGRADE v3.4: try to start the streaming player. Returns True if it
+    works. If not (library missing, no sound card...) we print why, and
+    play_chord()/stop_chord() automatically use winsound like in v3.3."""
+    global audio_player
+    if sounddevice is None:
+        print("sounddevice not installed - chords will re-strum every "
+              f"{LOOP_DURATION:.0f} s (winsound). Install it with: "
+              "python -m pip install sounddevice")
+        return False
+    try:
+        player = ChordPlayer()
+        player.start()
+    except Exception as error:
+        print("Could not open the sound card with sounddevice:", error)
+        print(f"Falling back to winsound (chords re-strum every {LOOP_DURATION:.0f} s).")
+        return False
+    audio_player = player
+    return True
+
+
+def close_audio():
+    """UPGRADE v3.4: close the sound card connection when quitting."""
+    global audio_player
+    if audio_player is not None:
+        audio_player.close()
+        audio_player = None
+
+
 def stop_chord():
-    """Stop whatever sound is playing (does nothing without winsound)."""
+    """Stop whatever sound is playing.
+    UPGRADE v3.4: with the streaming player this is a short fade-out
+    (RELEASE_FADE_SECONDS) instead of a hard cut. Without it, the old
+    winsound stop is used (does nothing without winsound)."""
+    if audio_player is not None:
+        audio_player.release_all()
+        return
     if winsound is None:
         return
     try:
@@ -1766,14 +2041,26 @@ def stop_chord():
 
 
 def play_chord(chord_name, muted=False):
-    """Start looping a chord's .wav in the background.
+    """Start a chord in the background.
+
+    UPGRADE v3.4: with the streaming player the chord is strummed once and
+    then RINGS UNTIL stop_chord() is called - i.e. for as long as the hands
+    hold it. Only if that player isn't available do we use the old way:
     SND_ASYNC = don't freeze the program while playing,
-    SND_LOOP  = repeat until stop_chord() is called.
+    SND_LOOP  = repeat the 2 s .wav until stop_chord() is called.
 
     UPGRADE v3.1: new 'muted' parameter. When muted is True we simply
     don't start any sound. The rest of the program still thinks the chord
     is "playing" (silently), so un-muting can restart it straight away."""
-    if muted or winsound is None or chord_name not in CHORDS:
+    if muted or chord_name not in CHORDS:
+        return
+    if audio_player is not None:            # UPGRADE v3.4: held-chord player
+        try:
+            audio_player.play(chord_name)
+        except Exception as error:
+            print("Audio playback error:", error)
+        return
+    if winsound is None:
         return
     path = SOUND_DIR / f"{chord_name}.wav"
     if not path.exists():
@@ -2297,8 +2584,12 @@ def draw_panel(display, state, now):
         draw_text(panel, "PLAYING", (500, 70), 0.40, SUCCESS, 2)
     else:
         draw_text(panel, "SOUND OFF", (500, 70), 0.38, MUTED)
-    if winsound is None:
-        draw_text(panel, "(no winsound)", (500, 84), 0.30, WARNING)
+    # UPGRADE v3.4: say which audio path is in use. Nothing shown = the new
+    # held-chord player works. Otherwise warn, so you know why the chord
+    # re-strums every 2 s (fallback) or why there's no sound at all.
+    if audio_player is None:
+        draw_text(panel, "(winsound fallback)" if winsound is not None else "(no audio)",
+                  (500, 84), 0.30, WARNING)
 
     cv2.line(panel, (20, 90), (620, 90), BORDER, 1)
 
@@ -2587,13 +2878,19 @@ def run_application(camera_index=CAMERA_INDEX, start_muted=False,
     UPGRADE v3.2: added participant, eval_reps and force_fallback."""
 
     print("=" * 48)
-    print("HANDCHORD AI - VIRTUAL GUITAR v3.3")   # UPGRADE v3.3: version number
+    print("HANDCHORD AI - VIRTUAL GUITAR v3.4")   # UPGRADE v3.4: version number
     print("=" * 48)
-    if winsound is None:
-        print("WARNING: winsound is unavailable; audio playback is disabled.")
 
     # Make the .wav files before the camera starts (only the first time is slow).
     create_chord_files()
+
+    # UPGRADE v3.4: start the held-chord player. If it can't start,
+    # init_audio() prints why and the old winsound looping is used.
+    if init_audio():
+        print("Audio: chords ring for as long as you hold them.")
+    elif winsound is None:
+        print("WARNING: no audio available (no sounddevice, no winsound); "
+              "playback is disabled.")
 
     # All the program's changing state lives in this one dictionary,
     # so it's easy to pass to the drawing functions.
@@ -2860,6 +3157,7 @@ def run_application(camera_index=CAMERA_INDEX, start_muted=False,
         if state["evaluation"]["active"]:
             finish_evaluation(state["evaluation"], completed=False)
         stop_chord()
+        close_audio()   # UPGRADE v3.4: close the sound card stream
         camera.release()
         detector.close()
         cv2.destroyAllWindows()
@@ -2883,4 +3181,5 @@ if __name__ == "__main__":
         # Ctrl+C in the terminal = normal quit.
         print("\nApplication interrupted.")
         stop_chord()
+        close_audio()   # UPGRADE v3.4
         cv2.destroyAllWindows()

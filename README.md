@@ -2,8 +2,8 @@
 
 HandChordAI is a Windows desktop virtual guitar that turns two-hand gestures
 into guitar chords. It uses a webcam to track hand landmarks, interprets
-finger poses, and loops a guitar sound when a stable chord gesture is
-recognized.
+finger poses, and plays a guitar chord that keeps ringing for as long as a
+stable chord gesture is held.
 
 The application is implemented in [HandChordAI.py](./HandChordAI.py) with
 OpenCV, MediaPipe, NumPy, and Python's built-in audio/file modules.
@@ -83,7 +83,8 @@ indicates a muted string and `0` indicates an open string.
 
 ## Requirements
 
-- Windows, because playback uses the `winsound` module.
+- Windows recommended. Audio is streamed with `sounddevice` (v3.4) so chords
+  ring while held; without it the program falls back to `winsound` looping.
 - Python 3.10 or newer recommended.
 - A working webcam.
 - Internet access on the first run so the MediaPipe model can be downloaded.
@@ -209,8 +210,9 @@ are excluded from git. Back them up separately.
 6. Calibration can replace the built-in finger templates with per-hand models
    generated from seven recorded poses.
 7. The root and quality are combined into one of 36 chord keys.
-8. The matching WAV file from `sounds_v3` is looped asynchronously with Windows
-   audio playback while the OpenCV interface continues rendering.
+8. The matching strum from `sounds_v3` is played once, then a seamless
+   sustained version of the chord keeps ringing (streamed by `sounddevice`)
+   until the gesture ends, when it fades out. (v3.4)
 
 ## Troubleshooting
 
